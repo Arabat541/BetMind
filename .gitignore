@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Data & logs
+*.db
+*.log
+
+# Models
+*.pkl
+*.joblib
+
+# IDE
+.vscode/
+.idea/
