@@ -1,0 +1,17 @@
+[Unit]
+Description=BetMind Sports Betting Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evrard
+WorkingDirectory=/data/projects/python/BetMind/sports_betting
+ExecStart=/data/projects/python/BetMind/.venv/bin/python3 predictor.py --schedule
+Restart=always
+RestartSec=30
+StandardOutput=append:/data/projects/python/BetMind/sports_betting/logs/predictor.log
+StandardError=append:/data/projects/python/BetMind/sports_betting/logs/predictor.log
+
+[Install]
+WantedBy=multi-user.target

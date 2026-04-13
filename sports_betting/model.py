@@ -23,7 +23,11 @@ except ImportError:
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, log_loss
-from config import MODELS_DIR, VALUE_BET_EDGE, CONFIDENCE_THRESHOLD
+from config import (
+    MODELS_DIR, CONFIDENCE_THRESHOLD,
+    MIN_ODD_ALLOWED, MAX_ODD_ALLOWED, MAX_EDGE_SANITY, MIN_EV_REQUIRED,
+    VALUE_BET_EDGE_HOME, VALUE_BET_EDGE_AWAY, VALUE_BET_EDGE_DRAW,
+)
 
 
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -45,10 +49,11 @@ class BettingModel:
     """
 
     def __init__(self, sport: str = "football"):
-        self.sport     = sport
-        self.model     = None
-        self.is_trained = False
-        self.model_path = os.path.join(MODELS_DIR, f"{sport}_xgb_model.pkl")
+        self.sport        = sport
+        self.model        = None
+        self.is_trained   = False
+        self.feature_cols = None  # chargé depuis le modèle pkl
+        self.model_path   = os.path.join(MODELS_DIR, f"{sport}_xgb_model.pkl")
         self._load_if_exists()
 
     def _load_if_exists(self):
@@ -57,6 +62,12 @@ class BettingModel:
                 self.model = pickle.load(f)
             self.is_trained = True
             logger.info(f"Model loaded: {self.model_path}")
+            # Récupérer les feature names depuis le modèle (sklearn >= 1.0)
+            try:
+                self.feature_cols = list(self.model.feature_names_in_)
+                logger.info(f"Features: {len(self.feature_cols)}")
+            except AttributeError:
+                self.feature_cols = None
 
     def train(self, X: pd.DataFrame, y: pd.Series):
         """Entraîne le modèle XGBoost sur des données historiques."""
@@ -117,9 +128,21 @@ class BettingModel:
     def _predict_xgb(self, features: dict) -> dict:
         """Prédiction via XGBoost."""
         from feature_engineering import get_feature_columns
-        cols = get_feature_columns(self.sport)
+        # Utilise les features du modèle entraîné (évite mismatch shape)
+        cols = self.feature_cols if self.feature_cols else get_feature_columns(self.sport)
         X = pd.DataFrame([{c: features.get(c, 0.0) for c in cols}])
         proba = self.model.predict_proba(X)[0]
+
+        if self.sport == "ou_football":
+            # Binaire : classes=[0=Under, 1=Over]
+            return {
+                "prob_over":  round(float(proba[1]), 4),
+                "prob_under": round(float(proba[0]), 4),
+                "prob_home":  round(float(proba[1]), 4),   # alias pour compatibilité
+                "prob_draw":  0.0,
+                "prob_away":  round(float(proba[0]), 4),
+                "method":     "xgboost_ou"
+            }
 
         # XGBoost renvoie [H, D, A] si classes=[0,1,2]
         return {
@@ -205,26 +228,124 @@ def detect_value_bets(proba: dict, odds_row: dict, sport: str = "football") -> l
             ("D", proba.get("prob_draw", 0), odds_row.get("impl_draw", 0), odds_row.get("odd_draw"))
         )
 
+    _EDGE_MIN = {"H": VALUE_BET_EDGE_HOME, "A": VALUE_BET_EDGE_AWAY, "D": VALUE_BET_EDGE_DRAW}
+
     for result, p_model, p_implied, odd in candidates:
         if odd is None or p_implied == 0:
             continue
+
+        # ── Sanity check 1 : cote hors plage acceptable ──────
+        if not (MIN_ODD_ALLOWED <= odd <= MAX_ODD_ALLOWED):
+            continue
+
         edge = p_model - p_implied
-        if edge >= VALUE_BET_EDGE and p_model >= CONFIDENCE_THRESHOLD:
-            ev = (p_model * (odd - 1)) - (1 - p_model)
-            value_bets.append({
-                "result":     result,
-                "result_name": RESULT_NAMES.get(result, result),
-                "p_model":    round(p_model, 4),
-                "p_implied":  round(p_implied, 4),
-                "edge":       round(edge, 4),
-                "odd":        round(odd, 3),
-                "expected_value": round(ev, 4),
-                "is_value":   True,
-            })
+
+        # ── Sanity check 2 : edge insuffisant ou suspect ──────
+        if edge < _EDGE_MIN.get(result, VALUE_BET_EDGE_HOME):
+            continue
+        if edge > MAX_EDGE_SANITY:
+            continue  # >30% d'avantage = probablement erreur de modèle
+
+        # ── Sanity check 3 : confiance et EV ─────────────────
+        if p_model < CONFIDENCE_THRESHOLD:
+            continue
+
+        ev = (p_model * (odd - 1)) - (1 - p_model)
+        if ev < MIN_EV_REQUIRED:
+            continue  # EV trop faible même si edge positif
+
+        value_bets.append({
+            "result":         result,
+            "result_name":    RESULT_NAMES.get(result, result),
+            "p_model":        round(p_model, 4),
+            "p_implied":      round(p_implied, 4),
+            "edge":           round(edge, 4),
+            "odd":            round(odd, 3),
+            "expected_value": round(ev, 4),
+            "is_value":       True,
+        })
 
     # Trier par edge décroissant
     value_bets.sort(key=lambda x: x["edge"], reverse=True)
     return value_bets
+
+
+# ════════════════════════════════════════════════════════════
+# OVER/UNDER VALUE BET + SIGNAL
+# ════════════════════════════════════════════════════════════
+
+def detect_ou_value_bet(prob_over: float, ou_odds_row: dict) -> dict | None:
+    """
+    Détecte un value bet Over/Under 2.5.
+    Seuils : edge >= 7% (même que Away — variance comparable).
+    """
+    if not ou_odds_row:
+        return None
+
+    OU_EDGE_MIN = 0.07
+
+    for side, p_model, impl_key, odd_key in (
+        ("O", prob_over,       "impl_over",  "odd_over"),
+        ("U", 1 - prob_over,   "impl_under", "odd_under"),
+    ):
+        odd       = ou_odds_row.get(odd_key)
+        p_implied = ou_odds_row.get(impl_key, 0)
+        if odd is None or p_implied == 0:
+            continue
+        if not (MIN_ODD_ALLOWED <= odd <= MAX_ODD_ALLOWED):
+            continue
+        edge = p_model - p_implied
+        if edge < OU_EDGE_MIN or edge > MAX_EDGE_SANITY:
+            continue
+        if p_model < CONFIDENCE_THRESHOLD:
+            continue
+        ev = p_model * (odd - 1) - (1 - p_model)
+        if ev < MIN_EV_REQUIRED:
+            continue
+        return {
+            "result":         side,
+            "result_name":    "Over 2.5" if side == "O" else "Under 2.5",
+            "p_model":        round(p_model, 4),
+            "p_implied":      round(p_implied, 4),
+            "edge":           round(edge, 4),
+            "odd":            round(odd, 3),
+            "expected_value": round(ev, 4),
+            "is_value":       True,
+        }
+    return None
+
+
+def build_ou_signal(features: dict, ou_odds_row: dict,
+                    ou_model: "BettingModel", match_info: dict) -> dict | None:
+    """Signal Over/Under pour un match de foot. Retourne None si pas de value."""
+    if not ou_model.is_trained:
+        return None
+
+    proba     = ou_model.predict_proba(features)
+    prob_over = proba.get("prob_over", proba.get("prob_home", 0))
+    vb        = detect_ou_value_bet(prob_over, ou_odds_row)
+    if vb is None:
+        return None
+
+    return {
+        "sport":       "football",
+        "league":      match_info.get("league", ""),
+        "home_team":   match_info.get("home_team", ""),
+        "away_team":   match_info.get("away_team", ""),
+        "match_date":  match_info.get("date", ""),
+        "pred_result": vb["result"],
+        "pred_name":   vb["result_name"],
+        "prob_home":   prob_over,
+        "prob_draw":   0.0,
+        "prob_away":   round(1 - prob_over, 4),
+        "confidence":  round(vb["p_model"], 4),
+        "method":      proba.get("method", "xgboost_ou"),
+        "value_bets":  [vb],
+        "is_value_bet": True,
+        "edge":        vb["edge"],
+        "odd_used":    vb["odd"],
+        "market":      "OU25",
+    }
 
 
 # ════════════════════════════════════════════════════════════
@@ -242,7 +363,24 @@ def build_prediction_signal(
     Pipeline complet : features → proba → value bets → signal.
     Retourne un dict prêt pour la DB et le dashboard.
     """
-    proba = model.predict_proba(features)
+    # Fusionner les cotes bookmaker dans les features
+    # (le modèle football est entraîné avec impl_home/draw/away, odd_*, has_odds)
+    enriched = dict(features)
+    if odds_row:
+        odd_h = odds_row.get("odd_home")
+        odd_d = odds_row.get("odd_draw")
+        odd_a = odds_row.get("odd_away")
+        enriched.update({
+            "impl_home":  odds_row.get("impl_home", 0.33),
+            "impl_draw":  odds_row.get("impl_draw", 0.33),
+            "impl_away":  odds_row.get("impl_away", 0.33),
+            "odd_home":   odd_h or 2.5,
+            "odd_draw":   odd_d or 3.3,
+            "odd_away":   odd_a or 2.5,
+            "has_odds":   1.0 if (odd_h and odd_d and odd_a) else 0.0,
+        })
+
+    proba = model.predict_proba(enriched)
 
     # Résultat le plus probable
     if sport == "football":
@@ -273,7 +411,7 @@ def build_prediction_signal(
         "method":      proba.get("method", ""),
         "value_bets":  value_bets,
         "is_value_bet": len(value_bets) > 0,
-        "top_edge":    value_bets[0]["edge"] if value_bets else 0.0,
+        "edge":        value_bets[0]["edge"] if value_bets else 0.0,
         "top_odd":     value_bets[0]["odd"]  if value_bets else None,
         "odd_used":    value_bets[0]["odd"]  if value_bets else None,
     }

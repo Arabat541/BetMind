@@ -1,0 +1,13 @@
+
+## Améliorations qualitatives — classées par priorité
+
+
+### E — Rapport hebdomadaire enrichi (BASSE)
+`send_weekly_summary` actuel : uniquement stats globales.
+Ajouter : ROI de la semaine écoulée (vs cumul), ligue la plus rentable de la semaine,
+meilleure prédiction (plus grosse mise gagnée), série en cours (streak W/L).
+
+### F — Alerte dérive du modèle (BASSE)
+Si win rate sur les 20 derniers paris réglés < 30%, envoyer une alerte Telegram :
+possible dérive du modèle (données ou marché ont changé).
+Calculer dans result_checker après chaque batch de résultats.

@@ -6,10 +6,10 @@ import logging
 import numpy as np
 import pandas as pd
 from data_fetcher import (
-    fetch_team_stats, fetch_h2h,
-    fetch_nba_team_stats
+    fetch_team_stats, fetch_h2h, fetch_standings, get_team_standing,
+    fetch_nba_team_stats, get_injury_stats
 )
-from config import FORM_WINDOW, MIN_MATCHES_MODEL
+from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,12 @@ def build_football_features(home_id: int, away_id: int,
     """
     logger.info(f"Building football features: {home_name} vs {away_name}")
 
-    home_stats = fetch_team_stats(home_id, league_code)
-    away_stats = fetch_team_stats(away_id, league_code)
-    h2h_df     = fetch_h2h(home_id, away_id, last_n=10)
+    home_stats   = fetch_team_stats(home_id, league_code)
+    away_stats   = fetch_team_stats(away_id, league_code)
+    h2h_df       = fetch_h2h(home_id, away_id, last_n=10)
+    standings_df = fetch_standings(league_code) if league_code else pd.DataFrame()
+    home_std     = get_team_standing(standings_df, home_id)
+    away_std     = get_team_standing(standings_df, away_id)
 
     if not home_stats or not away_stats:
         logger.warning(f"Insufficient stats for {home_name} or {away_name}")
@@ -49,11 +52,18 @@ def build_football_features(home_id: int, away_id: int,
     away_attack  = away_stats["goals_for_avg"] / max(avg_goals_league / 2, 0.1)
     away_defense = away_stats["goals_ag_avg"]  / max(avg_goals_league / 2, 0.1)
 
+    home_form_long = home_stats.get("form_score_long", home_stats["form_score"])
+    away_form_long = away_stats.get("form_score_long", away_stats["form_score"])
+
     features = {
-        # Forme récente (0-1)
+        # Forme récente 5 matchs (0-1)
         "home_form":            home_stats["form_score"],
         "away_form":            away_stats["form_score"],
         "form_diff":            home_stats["form_score"] - away_stats["form_score"],
+        # Forme longue 10 matchs (0-1)
+        "home_form_long":       home_form_long,
+        "away_form_long":       away_form_long,
+        "form_diff_long":       home_form_long - away_form_long,
 
         # Stats offensives / défensives
         "home_goals_for_avg":   home_stats["goals_for_avg"],
@@ -77,6 +87,17 @@ def build_football_features(home_id: int, away_id: int,
         "away_clean_sheet_rate": _clean_sheet_rate(away_stats),
         "home_scoring_rate":     _scoring_rate(home_stats),
         "away_scoring_rate":     _scoring_rate(away_stats),
+
+        # Classement (points/match dans la saison)
+        "home_pts_per_game":    home_std["pts_per_game"],
+        "away_pts_per_game":    away_std["pts_per_game"],
+        "pts_per_game_diff":    round(home_std["pts_per_game"] - away_std["pts_per_game"], 4),
+
+        # Forme spécifique domicile / extérieur
+        "home_form_home":       home_stats.get("home_form_score", home_stats["form_score"]),
+        "away_form_away":       away_stats.get("away_form_score", away_stats["form_score"]),
+        "home_away_form_diff":  home_stats.get("home_form_score", home_stats["form_score"])
+                                - away_stats.get("away_form_score", away_stats["form_score"]),
 
         # Avantage domicile (feature booléenne)
         "home_advantage":       1.0,
@@ -150,7 +171,8 @@ def _compute_h2h_features(h2h_df: pd.DataFrame, home_id: int) -> dict:
 # ════════════════════════════════════════════════════════════
 
 def build_nba_features(home_id: int, away_id: int,
-                        home_name: str = "", away_name: str = "") -> dict | None:
+                        home_name: str = "", away_name: str = "",
+                        injuries_dict: dict = None) -> dict | None:
     """
     Construit le vecteur de features pour un match NBA.
     """
@@ -191,6 +213,16 @@ def build_nba_features(home_id: int, away_id: int,
         "home_advantage":     1.0,
     }
 
+    # ── Blessures (ESPN) ────────────────────────────────────
+    home_inj = get_injury_stats(injuries_dict or {}, home_name)
+    away_inj = get_injury_stats(injuries_dict or {}, away_name)
+    features["home_injuries_out"] = home_inj["out"]
+    features["home_injuries_dtd"] = home_inj["day_to_day"]
+    features["away_injuries_out"] = away_inj["out"]
+    features["away_injuries_dtd"] = away_inj["day_to_day"]
+    # impact_diff > 0 = avantage domicile (l'adverse est plus touché)
+    features["injury_diff"]       = round(away_inj["impact"] - home_inj["impact"], 4)
+
     return features
 
 
@@ -208,6 +240,7 @@ def get_feature_columns(sport: str = "football") -> list:
     if sport == "football":
         return [
             "home_form", "away_form", "form_diff",
+            "home_form_long", "away_form_long", "form_diff_long",
             "home_goals_for_avg", "home_goals_ag_avg",
             "away_goals_for_avg", "away_goals_ag_avg",
             "home_attack_str", "home_defense_str",
@@ -215,10 +248,22 @@ def get_feature_columns(sport: str = "football") -> list:
             "home_win_rate", "away_win_rate", "win_rate_diff",
             "home_clean_sheet_rate", "away_clean_sheet_rate",
             "home_scoring_rate", "away_scoring_rate",
+            "home_pts_per_game", "away_pts_per_game", "pts_per_game_diff",
+            "home_form_home", "away_form_away", "home_away_form_diff",
             "home_advantage",
             "h2h_home_win_rate", "h2h_draw_rate", "h2h_away_win_rate",
             "h2h_avg_goals", "h2h_matches",
             "home_lambda", "away_lambda", "total_goals_exp",
+        ]
+    elif sport == "ou_football":
+        return [
+            "home_goals_for_avg", "home_goals_ag_avg",
+            "away_goals_for_avg", "away_goals_ag_avg",
+            "home_attack_str",    "home_defense_str",
+            "away_attack_str",    "away_defense_str",
+            "home_scoring_rate",  "away_scoring_rate",
+            "home_lambda",        "away_lambda",
+            "total_goals_exp",    "h2h_avg_goals",
         ]
     elif sport == "nba":
         return [
@@ -228,5 +273,8 @@ def get_feature_columns(sport: str = "football") -> list:
             "home_pts_diff", "away_pts_diff", "pts_diff_gap",
             "home_off_eff", "away_off_eff",
             "home_advantage",
+            "home_injuries_out", "home_injuries_dtd",
+            "away_injuries_out", "away_injuries_dtd",
+            "injury_diff",
         ]
     return []

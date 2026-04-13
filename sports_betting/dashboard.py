@@ -169,6 +169,30 @@ TEMPLATE = """
     </div>
   </div>
 
+  <!-- Exposition journalière -->
+  <div class="chart-card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <span class="chart-title" style="margin:0">⚡ Exposition journalière</span>
+      <span id="exposure-pct" style="font-family:'JetBrains Mono';font-size:13px;color:var(--muted)">—</span>
+    </div>
+    <div style="background:var(--surface2);border-radius:6px;height:10px;overflow:hidden;margin-bottom:8px;">
+      <div id="exposure-bar" style="height:100%;width:0%;border-radius:6px;background:var(--green);transition:width .6s,background .6s;"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono';font-size:11px;color:var(--muted);">
+      <span id="exposure-staked">0 FCFA misés ce jour</span>
+      <span id="exposure-limit">Limite : — FCFA</span>
+    </div>
+  </div>
+
+  <!-- Bankroll chart -->
+  <div class="chart-card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <span class="chart-title" style="margin:0">Évolution bankroll</span>
+      <span id="bankroll-delta" style="font-family:'JetBrains Mono';font-size:12px;color:var(--muted)">—</span>
+    </div>
+    <canvas id="chartBankroll" height="100"></canvas>
+  </div>
+
   <!-- Charts -->
   <div class="charts-row">
     <div class="chart-card">
@@ -181,11 +205,42 @@ TEMPLATE = """
     </div>
   </div>
 
+  <!-- ROI par ligue -->
+  <div class="table-card" id="roi-section">
+    <div class="table-header">
+      <span class="table-title">Performance par ligue</span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Ligue</th><th>Sport</th><th>Paris</th><th>W</th>
+            <th>Win Rate</th><th>P&L (FCFA)</th><th>ROI</th>
+          </tr>
+        </thead>
+        <tbody id="roi-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Table -->
   <div class="table-card">
     <div class="table-header">
       <span class="table-title">Prédictions récentes</span>
-      <button class="refresh-btn" onclick="loadData()">⟳ Actualiser</button>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select id="filter-sport" onchange="applyFilter()"
+          style="background:var(--card);color:var(--text);border:1px solid #2a3a4a;border-radius:6px;padding:4px 8px;font-size:13px;">
+          <option value="">Tous les sports</option>
+          <option value="football">⚽ Football</option>
+          <option value="nba">🏀 NBA</option>
+        </select>
+        <select id="filter-type" onchange="applyFilter()"
+          style="background:var(--card);color:var(--text);border:1px solid #2a3a4a;border-radius:6px;padding:4px 8px;font-size:13px;">
+          <option value="">Tous les types</option>
+          <option value="value">🔥 Value Bets</option>
+        </select>
+        <button class="refresh-btn" onclick="loadData()">⟳ Actualiser</button>
+      </div>
     </div>
     <div style="overflow-x:auto;">
       <table>
@@ -203,14 +258,21 @@ TEMPLATE = """
 </main>
 
 <script>
-let chartResult = null, chartConf = null;
+let chartResult = null, chartConf = null, chartBankroll = null;
+let allPreds = [];
 
 async function loadData() {
-  const [statsRes, predsRes] = await Promise.all([
-    fetch('/api/stats'), fetch('/api/predictions')
+  const [statsRes, predsRes, roiRes, bkRes, expRes] = await Promise.all([
+    fetch('/api/stats'), fetch('/api/predictions'),
+    fetch('/api/roi_by_league'), fetch('/api/bankroll_history'),
+    fetch('/api/daily_exposure')
   ]);
-  const stats = await statsRes.json();
-  const preds = await predsRes.json();
+  const stats   = await statsRes.json();
+  const preds   = await predsRes.json();
+  const roiData = await roiRes.json();
+  const bkData  = await bkRes.json();
+  const expData = await expRes.json();
+  allPreds = preds;
 
   document.getElementById('updated').textContent =
     new Date().toLocaleTimeString('fr-FR');
@@ -234,8 +296,102 @@ async function loadData() {
   document.getElementById('kpi-vb').textContent =
     preds.filter(p => p.is_value_bet).length;
 
+  buildExposureBar(expData);
+  buildBankrollChart(bkData);
   buildCharts(preds);
   buildTable(preds);
+  buildRoiTable(roiData);
+}
+
+function buildExposureBar(data) {
+  const pct   = data.pct_used || 0;
+  const color = pct >= 80 ? 'var(--red)' : pct >= 50 ? 'var(--gold)' : 'var(--green)';
+  document.getElementById('exposure-bar').style.width      = pct + '%';
+  document.getElementById('exposure-bar').style.background = color;
+  document.getElementById('exposure-pct').textContent      = pct.toFixed(1) + '%';
+  document.getElementById('exposure-pct').style.color      = color;
+  document.getElementById('exposure-staked').textContent   =
+    (data.staked_today || 0).toLocaleString('fr-FR') + ' FCFA misés ce jour';
+  document.getElementById('exposure-limit').textContent    =
+    'Limite : ' + (data.daily_limit || 0).toLocaleString('fr-FR') + ' FCFA';
+}
+
+function buildBankrollChart(data) {
+  if (chartBankroll) chartBankroll.destroy();
+  if (!data.length) return;
+
+  // Grouper par date → dernier solde du jour
+  const byDate = {};
+  data.forEach(d => { byDate[d.date] = d.balance; });
+  const labels = Object.keys(byDate).sort();
+  const values = labels.map(d => byDate[d]);
+
+  const initial = values[0] || 100000;
+  const last    = values[values.length - 1];
+  const delta   = last - initial;
+  const deltaEl = document.getElementById('bankroll-delta');
+  deltaEl.textContent = `${delta >= 0 ? '+' : ''}${delta.toLocaleString('fr-FR')} FCFA depuis le départ`;
+  deltaEl.style.color = delta >= 0 ? 'var(--green)' : 'var(--red)';
+
+  const lineColor = last >= initial ? '#00e676' : '#ff4757';
+  chartBankroll = new Chart(document.getElementById('chartBankroll'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        borderColor: lineColor,
+        backgroundColor: `${lineColor}14`,
+        borderWidth: 2,
+        pointRadius: values.length < 30 ? 4 : 1,
+        pointBackgroundColor: lineColor,
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.parsed.y.toLocaleString('fr-FR') + ' FCFA'
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#5a7a99', maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,.04)' } },
+        y: { ticks: { color: '#5a7a99', callback: v => (v/1000).toFixed(0) + 'k' },
+             grid: { color: 'rgba(255,255,255,.04)' } }
+      }
+    }
+  });
+}
+
+function applyFilter() {
+  const sport = document.getElementById('filter-sport').value;
+  const type  = document.getElementById('filter-type').value;
+  let filtered = allPreds;
+  if (sport) filtered = filtered.filter(p => p.sport === sport);
+  if (type === 'value') filtered = filtered.filter(p => p.is_value_bet);
+  buildTable(filtered);
+}
+
+function buildRoiTable(data) {
+  const tbody = document.getElementById('roi-tbody');
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);text-align:center">Aucun pari réglé</td></tr>'; return; }
+  tbody.innerHTML = data.map(r => {
+    const roiColor = r.roi >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnlColor = r.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    return `<tr>
+      <td><b>${r.league}</b></td>
+      <td>${r.sport === 'football' ? '⚽' : '🏀'}</td>
+      <td style="font-family:'JetBrains Mono'">${r.bets}</td>
+      <td style="font-family:'JetBrains Mono'">${r.wins}</td>
+      <td style="font-family:'JetBrains Mono';color:var(--gold)">${r.win_rate}%</td>
+      <td style="font-family:'JetBrains Mono';color:${pnlColor}">${r.pnl >= 0 ? '+' : ''}${r.pnl.toLocaleString('fr-FR')}</td>
+      <td style="font-family:'JetBrains Mono';color:${roiColor};font-weight:700">${r.roi >= 0 ? '+' : ''}${r.roi}%</td>
+    </tr>`;
+  }).join('');
 }
 
 function buildCharts(preds) {
@@ -367,6 +523,80 @@ def api_stats():
     clean = {k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
              for k, v in stats.items()}
     return jsonify(clean)
+
+
+@app.route("/api/roi_by_league")
+def api_roi_by_league():
+    """ROI et win rate par ligue (paris déjà réglés uniquement)."""
+    import math, sqlite3
+    from config import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT league, sport,
+               COUNT(*) as bets,
+               SUM(CASE WHEN pred_result = outcome THEN 1 ELSE 0 END) as wins,
+               SUM(COALESCE(pnl, 0))  as pnl,
+               SUM(COALESCE(kelly_stake, 0)) as staked
+        FROM predictions
+        WHERE outcome IS NOT NULL AND kelly_stake > 0
+        GROUP BY league, sport
+        ORDER BY pnl DESC
+    """).fetchall()
+    conn.close()
+
+    result = []
+    for league, sport, bets, wins, pnl, staked in rows:
+        roi = (pnl / staked * 100) if staked else 0.0
+        wr  = (wins / bets * 100)  if bets  else 0.0
+        if not (math.isnan(roi) or math.isinf(roi)):
+            result.append({
+                "league": league, "sport": sport,
+                "bets": bets, "wins": int(wins or 0),
+                "win_rate": round(wr, 1),
+                "pnl": round(pnl or 0, 0),
+                "roi": round(roi, 2),
+            })
+    return jsonify(result)
+
+
+@app.route("/api/bankroll_history")
+def api_bankroll_history():
+    """Historique de la bankroll (un point par paris réglé)."""
+    import sqlite3
+    from config import DB_PATH, INITIAL_BANKROLL
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT updated_at, balance FROM bankroll ORDER BY id ASC"
+    ).fetchall()
+    conn.close()
+    data = [{"date": r[0][:10] if r[0] else "", "balance": r[1]} for r in rows]
+    # Toujours au moins le point de départ
+    if not data:
+        from datetime import date
+        data = [{"date": str(date.today()), "balance": INITIAL_BANKROLL}]
+    return jsonify(data)
+
+
+@app.route("/api/daily_exposure")
+def api_daily_exposure():
+    """Exposition journalière : misé aujourd'hui vs limite (15% bankroll)."""
+    import sqlite3
+    from config import DB_PATH, MAX_DAILY_STAKE_PCT
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("""
+        SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
+        WHERE DATE(created_at) = date('now') AND kelly_stake > 0
+    """).fetchone()
+    conn.close()
+    staked_today = float(row[0]) if row else 0.0
+    bankroll     = tracker.get_balance()
+    daily_limit  = bankroll * MAX_DAILY_STAKE_PCT
+    pct_used     = (staked_today / daily_limit * 100) if daily_limit > 0 else 0.0
+    return jsonify({
+        "staked_today": round(staked_today, 0),
+        "daily_limit":  round(daily_limit, 0),
+        "pct_used":     round(min(pct_used, 100), 1),
+    })
 
 
 @app.route("/api/run")

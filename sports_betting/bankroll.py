@@ -5,8 +5,9 @@
 import logging
 import sqlite3
 import pandas as pd
+from datetime import datetime
 from config import (
-    KELLY_FRACTION, MAX_BET_PCT, INITIAL_BANKROLL, DB_PATH
+    KELLY_FRACTION, KELLY_FRACTION_DRAW, MAX_BET_PCT, INITIAL_BANKROLL, DB_PATH
 )
 
 logger = logging.getLogger(__name__)
@@ -62,19 +63,27 @@ def kelly_stake(prob: float, odd: float, bankroll: float,
     }
 
 
+def _is_draw_bet(result_name: str) -> bool:
+    """Détecte si le pari porte sur le nul (outcome le plus imprévisible)."""
+    return result_name.strip().lower() in ("draw", "d", "nul", "draw win")
+
+
 def recommended_stake(signal: dict, bankroll: float) -> dict:
     """
     Calcule la mise recommandée pour un signal de pari.
     Utilise le meilleur value bet s'il existe, sinon le pred principal.
+    Les paris sur le nul reçoivent un Kelly réduit (KELLY_FRACTION_DRAW).
     """
     value_bets = signal.get("value_bets", [])
 
     if value_bets:
         vb = value_bets[0]  # meilleur edge
+        fraction = KELLY_FRACTION_DRAW if _is_draw_bet(vb.get("result_name", "")) else KELLY_FRACTION
         result = kelly_stake(
             prob=vb["p_model"],
             odd=vb["odd"],
-            bankroll=bankroll
+            bankroll=bankroll,
+            fraction=fraction,
         )
         result["bet_on"]    = vb["result_name"]
         result["odd"]       = vb["odd"]
@@ -84,8 +93,10 @@ def recommended_stake(signal: dict, bankroll: float) -> dict:
         # Pas de value bet → mise minimale de conviction
         conf = signal.get("confidence", 0)
         odd  = signal.get("odd_used") or 1.0
-        result = kelly_stake(prob=conf, odd=odd, bankroll=bankroll)
-        result["bet_on"]   = signal.get("pred_name", "")
+        pred_name = signal.get("pred_name", "")
+        fraction = KELLY_FRACTION_DRAW if _is_draw_bet(pred_name) else KELLY_FRACTION
+        result = kelly_stake(prob=conf, odd=odd, bankroll=bankroll, fraction=fraction)
+        result["bet_on"]   = pred_name
         result["odd"]      = odd
         result["edge"]     = 0.0
         result["is_value"] = False
@@ -128,6 +139,17 @@ class BankrollTracker:
         conn.close()
         return row[0] if row else INITIAL_BANKROLL
 
+    def get_today_staked(self) -> float:
+        """Retourne la somme des mises déjà enregistrées aujourd'hui (en FCFA)."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions WHERE DATE(created_at) = ?",
+            (today,)
+        ).fetchone()
+        conn.close()
+        return float(row[0]) if row else 0.0
+
     def get_stats(self) -> dict:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -151,6 +173,37 @@ class BankrollTracker:
             stats["win_rate"]    = round(stats["wins"] / len(df) * 100, 1)
             stats["total_pnl"]   = round(total_pnl, 0)
         return stats
+
+    def get_today_stats(self) -> dict:
+        """Stats des paris d'aujourd'hui uniquement."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn  = sqlite3.connect(DB_PATH)
+        row   = conn.execute("""
+            SELECT
+                COUNT(*)                                                  AS bets,
+                SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END)      AS settled,
+                SUM(CASE WHEN pnl > 0             THEN 1 ELSE 0 END)      AS wins,
+                SUM(CASE WHEN pnl < 0             THEN 1 ELSE 0 END)      AS losses,
+                COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN pnl        ELSE 0 END), 0) AS pnl,
+                COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN kelly_stake ELSE 0 END), 0) AS staked
+            FROM predictions
+            WHERE DATE(created_at) = ?
+        """, (today,)).fetchone()
+        conn.close()
+        bets, settled, wins, losses, pnl, staked = row or (0, 0, 0, 0, 0, 0)
+        settled  = int(settled  or 0)
+        staked   = float(staked or 0)
+        pnl      = float(pnl    or 0)
+        return {
+            "bets":     int(bets     or 0),
+            "settled":  settled,
+            "wins":     int(wins     or 0),
+            "losses":   int(losses   or 0),
+            "pnl":      round(pnl,   0),
+            "staked":   round(staked, 0),
+            "roi":      round(pnl / staked * 100, 2) if staked > 0 else 0.0,
+            "win_rate": round(int(wins or 0) / settled * 100, 1) if settled > 0 else 0.0,
+        }
 
     def settle_bet(self, prediction_id: int, outcome: str):
         """

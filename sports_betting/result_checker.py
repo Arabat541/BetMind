@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import FOOTBALL_DATA_KEY, FOOTBALL_DATA_BASE, DB_PATH, BALLDONTLIE_KEY
+from data_fetcher import _http_get_with_retry
 from bankroll import BankrollTracker
 from telegram_bot import send_message
 
@@ -22,6 +23,18 @@ tracker = BankrollTracker()
 # ── Cache par date (évite les appels répétés pour la même journée) ──
 _nba_results_cache  = {}   # {date_str: [games]}
 _foot_results_cache = {}   # {date_str: [matches]}
+_espn_cl_cache      = {}   # {yyyymmdd: [events]}
+
+# Slugs ESPN par ligue BetMind
+_ESPN_SOCCER_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+_ESPN_LEAGUE_SLUGS = {
+    "Champions League": "UEFA.CHAMPIONS",
+    "Premier League":   "ENG.1",
+    "Ligue 1":          "FRA.1",
+    "La Liga":          "ESP.1",
+    "Serie A":          "ITA.1",
+    "Bundesliga":       "GER.1",
+}
 
 
 # ════════════════════════════════════════════════════════════
@@ -32,12 +45,7 @@ def _fd_get(endpoint: str, params: dict = {}) -> dict:
     headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     url = f"{FOOTBALL_DATA_BASE}/{endpoint}"
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        if r.status_code == 429:
-            logger.warning("Rate limit football-data.org, pause 60s...")
-            time.sleep(60)
-            r = requests.get(url, headers=headers, params=params, timeout=10)
-        r.raise_for_status()
+        r = _http_get_with_retry(url, headers=headers, params=params)
         return r.json()
     except Exception as e:
         logger.error(f"football-data.org error [{endpoint}]: {e}")
@@ -48,8 +56,7 @@ def _balldontlie_get(endpoint: str, params: dict = {}) -> dict:
     url = f"https://api.balldontlie.io/v1/{endpoint}"
     headers = {"Authorization": BALLDONTLIE_KEY} if BALLDONTLIE_KEY else {}
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        r.raise_for_status()
+        r = _http_get_with_retry(url, headers=headers, params=params)
         return r.json()
     except Exception as e:
         logger.error(f"BallDontLie error [{endpoint}]: {e}")
@@ -76,6 +83,43 @@ def _get_nba_games_for_date(date_str: str) -> list:
     return games
 
 
+def _get_espn_result(home_team: str, away_team: str, date_str: str, league: str) -> str | None:
+    """
+    Résultat depuis l'API ESPN non officielle.
+    Utilisé pour CL (non couvert par football-data.org gratuit) et en fallback.
+    """
+    slug = _ESPN_LEAGUE_SLUGS.get(league)
+    if not slug:
+        return None
+    yyyymmdd = date_str.replace("-", "")
+    cache_key = f"{slug}_{yyyymmdd}"
+    if cache_key not in _espn_cl_cache:
+        try:
+            url = f"{_ESPN_SOCCER_BASE}/{slug}/scoreboard"
+            r = _http_get_with_retry(url, headers={"User-Agent": "Mozilla/5.0"},
+                                     params={"dates": yyyymmdd})
+            _espn_cl_cache[cache_key] = r.json().get("events", [])
+            logger.info(f"ESPN {slug} {date_str}: {len(_espn_cl_cache[cache_key])} matchs")
+        except Exception as e:
+            logger.warning(f"ESPN {slug} error: {e}")
+            _espn_cl_cache[cache_key] = []
+
+    for event in _espn_cl_cache.get(cache_key, []):
+        comp   = event["competitions"][0]
+        status = comp.get("status", {}).get("type", {}).get("description", "")
+        if "Full Time" not in status and "Final" not in status:
+            continue
+        teams = {c["homeAway"]: c for c in comp.get("competitors", [])}
+        h_name = teams.get("home", {}).get("team", {}).get("displayName", "")
+        a_name = teams.get("away", {}).get("team", {}).get("displayName", "")
+        if not (_fuzzy_match(h_name, home_team) and _fuzzy_match(a_name, away_team)):
+            continue
+        hs  = int(teams.get("home", {}).get("score", 0) or 0)
+        as_ = int(teams.get("away", {}).get("score", 0) or 0)
+        return "H" if hs > as_ else ("A" if as_ > hs else "D")
+    return None
+
+
 def _get_football_matches_for_date(date_str: str) -> list:
     """Récupère TOUS les matchs foot terminés d'une date en un seul appel."""
     if date_str in _foot_results_cache:
@@ -96,21 +140,74 @@ def _get_football_matches_for_date(date_str: str) -> list:
 # MATCHING & RÉSULTATS
 # ════════════════════════════════════════════════════════════
 
+# Noms ESPN (anglais) → mots-clés équivalents (langue originale)
+_ESPN_ALIASES: dict[str, str] = {
+    "cologne":   "köln",
+    "munich":    "münchen",
+    "rome":      "roma",
+    "naples":    "napoli",
+    "florence":  "fiorentina",
+    "genoa":     "genova",
+    "bilbao":    "athletic",
+    "seville":   "sevilla",
+    "coruña":    "celta",
+    "betis":     "betis",       # déjà identique
+    "leverkusen":"bayer",
+    "dortmund":  "borussia",
+}
+
+
 def _fuzzy_match(name1: str, name2: str) -> bool:
-    """Matching flexible sur les mots significatifs."""
-    SKIP = {"fc", "as", "sc", "ac", "rc", "us", "cf", "af", "bk", "la", "los"}
+    """
+    Matching flexible sur les mots significatifs.
+    Ex: 'Lyon'       ↔ 'Olympique Lyonnais' (sous-chaîne),
+        'FC Cologne' ↔ '1. FC Köln'         (alias),
+        'Inter'      ↔ 'FC Internazionale'  (sous-chaîne).
+    """
+    SKIP = {"fc", "as", "sc", "ac", "rc", "us", "cf", "af", "bk", "la", "los", "1."}
+
     def key_words(name: str) -> set:
-        return {w for w in name.lower().split() if w not in SKIP and len(w) > 2}
+        words = {w for w in name.lower().split() if w not in SKIP and len(w) > 2}
+        # Expansion des alias dans les deux sens
+        expanded = set(words)
+        for w in words:
+            if w in _ESPN_ALIASES:
+                expanded.add(_ESPN_ALIASES[w])
+            for alias, canonical in _ESPN_ALIASES.items():
+                if w == canonical:
+                    expanded.add(alias)
+        return expanded
+
     kw1 = key_words(name1)
     kw2 = key_words(name2)
-    return len(kw1 & kw2) > 0 if (kw1 and kw2) else False
+    if not kw1 or not kw2:
+        return False
+    # Correspondance exacte (après alias)
+    if kw1 & kw2:
+        return True
+    # Correspondance sous-chaîne (min 4 chars) : 'lyon' dans 'lyonnais', etc.
+    for w1 in kw1:
+        for w2 in kw2:
+            if len(w1) >= 4 and len(w2) >= 4 and (w1 in w2 or w2 in w1):
+                return True
+    return False
 
 
-def get_football_result(home_team: str, away_team: str, match_date: str) -> str | None:
-    """Résultat d'un match foot : H, D, A ou None."""
+def get_football_result(home_team: str, away_team: str,
+                         match_date: str, league: str = "") -> str | None:
+    """
+    Résultat d'un match foot : H, D, A ou None.
+    Champions League → ESPN en priorité (non couvert par football-data.org gratuit).
+    Autres ligues → football-data.org, puis ESPN en fallback.
+    """
     date_str = match_date[:10]
-    matches  = _get_football_matches_for_date(date_str)
 
+    # Champions League : ESPN direct (plus fiable que football-data.org gratuit)
+    if "champion" in league.lower():
+        return _get_espn_result(home_team, away_team, date_str, "Champions League")
+
+    # Ligues domestiques : football-data.org d'abord
+    matches = _get_football_matches_for_date(date_str)
     for match in matches:
         h = match["homeTeam"]["name"]
         a = match["awayTeam"]["name"]
@@ -122,6 +219,11 @@ def get_football_result(home_team: str, away_team: str, match_date: str) -> str 
         if hg is None or ag is None:
             return None
         return "H" if hg > ag else ("A" if ag > hg else "D")
+
+    # Fallback ESPN pour les ligues couvertes
+    if league in _ESPN_LEAGUE_SLUGS:
+        logger.info(f"Fallback ESPN pour {home_team} vs {away_team} ({league})")
+        return _get_espn_result(home_team, away_team, date_str, league)
 
     return None
 
@@ -210,7 +312,7 @@ def run_result_checker():
         SELECT * FROM predictions
         WHERE outcome IS NULL
         AND match_date IS NOT NULL
-        AND match_date <= date('now', '-1 day')
+        AND DATE(match_date) <= date('now', '-1 day')
         ORDER BY match_date ASC
     """, conn)
     conn.close()
@@ -232,7 +334,8 @@ def run_result_checker():
 
             # Résultat réel — via cache (1 appel par date)
             if sport == "football":
-                outcome = get_football_result(home_team, away_team, match_date)
+                league  = str(pred.get("league", ""))
+                outcome = get_football_result(home_team, away_team, match_date, league)
             elif sport == "nba":
                 outcome = get_nba_result(home_team, away_team, match_date)
             else:
