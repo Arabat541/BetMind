@@ -82,13 +82,32 @@ def send_prediction_alert(signal: dict, stake_info: dict):
         if home_out + away_out + home_dtd + away_dtd > 0:
             lines += ["", "🏥 <b>Blessures (ESPN) :</b>"]
             if home_out or home_dtd:
-                lines.append(
-                    f"  🏠 {signal['home_team'][:20]}: {home_out} OUT, {home_dtd} DTD"
-                )
+                lines.append(f"  🏠 {signal['home_team'][:20]}: {home_out} OUT, {home_dtd} DTD")
             if away_out or away_dtd:
-                lines.append(
-                    f"  ✈️  {signal['away_team'][:20]}: {away_out} OUT, {away_dtd} DTD"
-                )
+                lines.append(f"  ✈️  {signal['away_team'][:20]}: {away_out} OUT, {away_dtd} DTD")
+
+    # Sharp money — mouvement de cote depuis l'ouverture
+    mvt = signal.get("opening_movement_pct")
+    if mvt is not None:
+        mvt_pct = mvt * 100
+        if mvt_pct > 5:
+            lines += ["", f"📡 <b>Sharp Money :</b> cote ↓ {mvt_pct:.1f}% — sharps confirment ✅"]
+        elif mvt_pct < -5:
+            lines += ["", f"📡 <b>Sharp Money :</b> cote ↑ {abs(mvt_pct):.1f}% — marché contre nous ⚠️"]
+
+    # Météo — match sous la pluie ou vent fort
+    if signal.get("rainy_match"):
+        rain_mm   = signal.get("rain_mm", 0)
+        wind_kmh  = signal.get("wind_kmh", 0)
+        temp_c    = signal.get("temp_c")
+        weather_parts = []
+        if rain_mm:
+            weather_parts.append(f"🌧️ {rain_mm:.1f} mm/h")
+        if wind_kmh:
+            weather_parts.append(f"💨 {wind_kmh:.0f} km/h")
+        if temp_c is not None:
+            weather_parts.append(f"🌡️ {temp_c:.0f}°C")
+        lines += ["", f"⛈️ <b>Conditions météo :</b> {' | '.join(weather_parts)}"]
 
     lines += ["", "─" * 30, "🤖 BetMind Agent"]
     send_message("\n".join(lines))

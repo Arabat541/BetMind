@@ -485,6 +485,114 @@ def build_btts_signal(features: dict, btts_odds_row: dict,
 
 
 # ════════════════════════════════════════════════════════════
+# ARBITRAGE MULTI-BOOKMAKERS — M
+# ════════════════════════════════════════════════════════════
+
+def detect_arbitrage(odds_by_bookmaker: dict) -> dict | None:
+    """
+    Détecte une opportunité d'arbitrage pur entre plusieurs bookmakers.
+
+    odds_by_bookmaker : {
+        "bookmaker_A": {"H": 2.10, "D": 3.40, "A": 3.20},
+        "bookmaker_B": {"H": 2.05, "D": 3.50, "A": 3.30},
+        ...
+    }
+
+    Méthode : prend la meilleure cote disponible par outcome,
+    calcule la somme des inverses (1/odd). Si < 1.0 → arb détecté.
+
+    Returns:
+        dict avec best_odds, arb_pct (profit garanti en %), stakes_pct
+        ou None si pas d'arb.
+    """
+    if not odds_by_bookmaker:
+        return None
+
+    outcomes = ["H", "D", "A"]
+    best: dict[str, tuple[float, str]] = {}   # outcome → (meilleure cote, bookmaker)
+
+    for bk, odds in odds_by_bookmaker.items():
+        for outcome in outcomes:
+            odd = odds.get(outcome, 0)
+            if odd > 0:
+                if outcome not in best or odd > best[outcome][0]:
+                    best[outcome] = (odd, bk)
+
+    # Seulement si on a les 3 outcomes
+    if len(best) < 3:
+        return None
+
+    arb_sum = sum(1 / best[o][0] for o in outcomes)
+    if arb_sum >= 1.0:
+        return None   # Pas d'arbitrage
+
+    arb_pct = round((1 - arb_sum) * 100, 3)   # % de profit garanti
+
+    # Répartition des mises optimale (pour 100 unités investies)
+    stakes_pct = {
+        o: round(100 / (best[o][0] * arb_sum), 2)
+        for o in outcomes
+    }
+
+    return {
+        "arb_pct":    arb_pct,
+        "arb_sum":    round(arb_sum, 4),
+        "best_odds":  {o: {"odd": best[o][0], "bookmaker": best[o][1]} for o in outcomes},
+        "stakes_pct": stakes_pct,   # % à miser sur chaque outcome pour garantir le profit
+    }
+
+
+def detect_implied_value(model_proba: dict, odds_by_bookmaker: dict,
+                         min_edge: float = 0.03) -> list[dict]:
+    """
+    Compare les probas du modèle aux meilleures cotes disponibles
+    parmi plusieurs bookmakers → détecte les inefficiences de marché.
+
+    model_proba      : {"H": 0.45, "D": 0.28, "A": 0.27}
+    odds_by_bookmaker: {"bk1": {"H": 2.5, ...}, "bk2": {...}}
+
+    Returns liste de value bets triés par edge décroissant.
+    """
+    if not odds_by_bookmaker or not model_proba:
+        return []
+
+    outcomes = [o for o in ["H", "D", "A"] if o in model_proba]
+    value_bets = []
+
+    for outcome in outcomes:
+        p_model = model_proba[outcome]
+        # Meilleure cote disponible pour cet outcome
+        best_odd = 0.0
+        best_bk  = ""
+        for bk, odds in odds_by_bookmaker.items():
+            odd = odds.get(outcome, 0)
+            if odd > best_odd:
+                best_odd = odd
+                best_bk  = bk
+
+        if best_odd <= 1.0:
+            continue
+
+        p_implied = 1.0 / best_odd
+        edge      = p_model - p_implied
+        ev        = p_model * (best_odd - 1) - (1 - p_model)
+
+        if edge >= min_edge and ev > 0:
+            value_bets.append({
+                "outcome":    outcome,
+                "p_model":    round(p_model, 4),
+                "p_implied":  round(p_implied, 4),
+                "best_odd":   round(best_odd, 2),
+                "bookmaker":  best_bk,
+                "edge":       round(edge, 4),
+                "ev":         round(ev, 4),
+            })
+
+    value_bets.sort(key=lambda x: x["edge"], reverse=True)
+    return value_bets
+
+
+# ════════════════════════════════════════════════════════════
 # SIGNAL FINAL
 # ════════════════════════════════════════════════════════════
 

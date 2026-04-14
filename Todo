@@ -46,3 +46,45 @@
   fetch_football_ah_odds() dans data_fetcher.py (marché asian_handicap)
   Signal AH inséré dans run_football_predictions() (edge min 6%)
   Pas de modèle séparé — dérivé des probas du modèle football existant
+
+### ✅ Dashboard v2.0 — FAIT
+  Brier Score KPI, modèles status (ensemble/XGB/OU/BTTS/NBA)
+  Marchés couverts donut chart, Sharp money section
+  Colonne Marché + badges OVER/UNDER/BTTS/AH dans la table prédictions
+  Filtre marché dans la table, Performance par marché table
+  Routes : /api/models_status /api/market_stats /api/brier_score /api/sharp_money
+
+### ✅ L — Calibration isotonic sur l'EnsembleModel — FAIT
+  EnsembleModel.calibrate() : IsotonicRegression × 3 classes sur OOF probas
+  Appelé automatiquement dans train_ensemble() après le méta-modèle
+  probas renormalisées après calibration (clip + sum=1)
+
+### ✅ N — Retrain automatique hebdomadaire — FAIT
+  retrain.sh : lance train_from_csv.py + train_over_under.py + train_btts.py
+  Notification Telegram démarrage + fin (succès/erreur)
+  Rotation automatique des 5 derniers logs retrain_YYYYMMDD_HHMMSS.log
+  Cron suggéré : 0 3 * * 1  (lundi 3h UTC)
+  Installer : crontab -e → 0 3 * * 1 /home/evrard/apps/betmind/retrain.sh
+
+### ✅ O — Stop-loss dynamique par ligue — FAIT
+  BankrollTracker.is_league_suspended(league) dans bankroll.py
+  Critères sur 10 derniers paris de la ligue :
+    - ≥ 5 défaites consécutives → suspension
+    - ROI < -20% sur 10 paris → suspension
+  Vérifié dans run_football_predictions() avant chaque pari (après diversification)
+
+### ✅ Q — Alertes Telegram enrichies — FAIT
+  send_prediction_alert() dans telegram_bot.py :
+    - Sharp money : affiche mouvement cote ↓/↑ avec % si abs(mvt) > 5%
+    - Météo : affiche 🌧️ mm/h + 💨 km/h + 🌡️ °C si rainy_match=1
+
+### ✅ P — Backtesting interactif dans le dashboard — FAIT
+  Section "Backtesting — Simuler une période" avec slider dates + filtres sport/marché
+  Route /api/backtest?from=&to=&sport=&market= → KPIs + courbe P&L cumulé
+  Chart.js line chart du P&L cumulé sur la période, Brier Score inclus
+
+### ✅ M — Arbitrage / implied value multi-bookmakers — FAIT
+  detect_arbitrage(odds_by_bookmaker) dans model.py : arb_pct si somme inverses < 1
+  detect_implied_value(model_proba, odds_by_bookmaker) : value bets cross-bookmaker
+  Loggé dans run_football_predictions() après chaque signal 1X2
+  deploy.sh : redémarre betmind + betmind-dashboard après chaque déploiement

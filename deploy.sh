@@ -85,15 +85,19 @@ if $SYNTAX_OK; then
     echo "  Syntaxe OK"
 fi
 
-# ── Redémarrage service ──────────────────────────────────────
+# ── Redémarrage services ─────────────────────────────────────
 if $RESTART && $SYNTAX_OK; then
     echo ""
-    echo "  Redémarrage du service $SERVICE..."
-    ssh "$VPS_HOST" "sudo systemctl restart $SERVICE" && echo "  Service redémarré." || \
-        echo "  ⚠  Redémarrage manuel requis : sudo systemctl restart $SERVICE"
+    for SVC in "$SERVICE" "betmind-dashboard"; do
+        echo "  Redémarrage du service $SVC..."
+        ssh "$VPS_HOST" "sudo systemctl restart $SVC" && echo "  $SVC redémarré." || \
+            echo "  ⚠  Redémarrage manuel requis : sudo systemctl restart $SVC"
+    done
     sleep 2
-    STATUS=$(ssh "$VPS_HOST" "systemctl is-active $SERVICE 2>/dev/null" || echo "unknown")
-    echo "  Statut : $STATUS"
+    for SVC in "$SERVICE" "betmind-dashboard"; do
+        STATUS=$(ssh "$VPS_HOST" "systemctl is-active $SVC 2>/dev/null" || echo "unknown")
+        echo "  Statut $SVC : $STATUS"
+    done
 elif ! $SYNTAX_OK; then
     echo ""
     echo "  ⚠  Redémarrage annulé (erreur syntaxe). Corrige avant de redémarrer."

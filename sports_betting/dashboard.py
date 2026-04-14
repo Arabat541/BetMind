@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 from data_fetcher import get_all_predictions
 from bankroll import BankrollTracker
 from config import FLASK_PORT, FLASK_DEBUG
@@ -360,6 +360,41 @@ TEMPLATE = """
     </div>
   </div>
 
+  <!-- Backtesting interactif -->
+  <div class="chart-card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+      <span class="chart-title" style="margin:0">🔬 Backtesting — Simuler une période</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <label style="font-size:12px;color:var(--muted);font-family:'JetBrains Mono'">Du</label>
+        <input type="date" id="bt-from"
+          style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;font-family:'JetBrains Mono'">
+        <label style="font-size:12px;color:var(--muted);font-family:'JetBrains Mono'">au</label>
+        <input type="date" id="bt-to"
+          style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;font-family:'JetBrains Mono'">
+        <select id="bt-sport" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;">
+          <option value="">Tous sports</option>
+          <option value="football">⚽ Football</option>
+          <option value="nba">🏀 NBA</option>
+        </select>
+        <select id="bt-market" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;">
+          <option value="">Tous marchés</option>
+          <option value="1X2">1X2</option>
+          <option value="OU_2.5">O/U 2.5</option>
+          <option value="BTTS">BTTS</option>
+          <option value="AH_-0.5">AH -0.5</option>
+        </select>
+        <button class="refresh-btn" onclick="runBacktest()">▶ Simuler</button>
+      </div>
+    </div>
+    <div id="bt-results" style="display:none;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;" id="bt-kpis"></div>
+      <canvas id="chartBacktest" height="80"></canvas>
+    </div>
+    <div id="bt-empty" style="color:var(--muted);font-size:13px;font-family:'JetBrains Mono';text-align:center;padding:20px 0;">
+      Sélectionne une période et clique sur Simuler
+    </div>
+  </div>
+
   <!-- Predictions table -->
   <div class="table-card">
     <div class="table-header">
@@ -402,8 +437,20 @@ TEMPLATE = """
 
 <script>
 let chartResult = null, chartConf = null, chartBankroll = null, chartLeague = null;
-let chartConfRoi = null, chartMarket = null;
+let chartConfRoi = null, chartMarket = null, chartBacktest = null;
 let allPreds = [];
+
+// ── Initialise les dates du backtester ──────────────────────
+(function initBacktestDates() {
+  const today = new Date();
+  const from  = new Date(today);
+  from.setDate(from.getDate() - 30);
+  document.addEventListener('DOMContentLoaded', () => {
+    const fmt = d => d.toISOString().split('T')[0];
+    document.getElementById('bt-from').value = fmt(from);
+    document.getElementById('bt-to').value   = fmt(today);
+  });
+})();
 
 async function loadData() {
   const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes] = await Promise.all([
@@ -824,6 +871,94 @@ function buildTable(preds) {
   }).join('');
 }
 
+async function runBacktest() {
+  const from   = document.getElementById('bt-from').value;
+  const to     = document.getElementById('bt-to').value;
+  const sport  = document.getElementById('bt-sport').value;
+  const market = document.getElementById('bt-market').value;
+  if (!from || !to) return;
+
+  const params = new URLSearchParams({ from, to });
+  if (sport)  params.append('sport',  sport);
+  if (market) params.append('market', market);
+
+  const res  = await fetch('/api/backtest?' + params);
+  const data = await res.json();
+
+  document.getElementById('bt-empty').style.display   = 'none';
+  document.getElementById('bt-results').style.display = '';
+
+  // KPIs
+  const kpiColor = v => v >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('bt-kpis').innerHTML = `
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:var(--gold)">${data.bets}</div>
+      <div class="sharp-lbl">Paris réglés</div>
+    </div>
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:var(--green)">${data.wins}</div>
+      <div class="sharp-lbl">Victoires</div>
+    </div>
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:var(--gold)">${data.win_rate}%</div>
+      <div class="sharp-lbl">Win Rate</div>
+    </div>
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:${kpiColor(data.roi)}">${data.roi >= 0 ? '+' : ''}${data.roi}%</div>
+      <div class="sharp-lbl">ROI période</div>
+    </div>
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:${kpiColor(data.pnl)};font-size:20px">${data.pnl >= 0 ? '+' : ''}${(data.pnl||0).toLocaleString('fr-FR')}</div>
+      <div class="sharp-lbl">P&L (FCFA)</div>
+    </div>
+    <div class="sharp-card">
+      <div class="sharp-val" style="color:var(--purple)">${data.brier != null ? data.brier.toFixed(3) : '—'}</div>
+      <div class="sharp-lbl">Brier Score</div>
+    </div>
+  `;
+
+  // Courbe bankroll simulée
+  if (chartBacktest) chartBacktest.destroy();
+  const labels = data.curve.map(d => d.date);
+  const values = data.curve.map(d => d.cumulative_pnl);
+  const last   = values[values.length - 1] ?? 0;
+  const lineColor = last >= 0 ? '#00e676' : '#ff4757';
+
+  chartBacktest = new Chart(document.getElementById('chartBacktest'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'P&L cumulé (FCFA)',
+        data: values,
+        borderColor: lineColor,
+        backgroundColor: `${lineColor}14`,
+        borderWidth: 2,
+        pointRadius: values.length < 40 ? 3 : 0,
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => (ctx.parsed.y >= 0 ? '+' : '') + ctx.parsed.y.toLocaleString('fr-FR') + ' FCFA'
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#5a7a99', maxTicksLimit: 12 }, grid: { color: 'rgba(255,255,255,.04)' } },
+        y: {
+          ticks: { color: '#5a7a99', callback: v => (v >= 0 ? '+' : '') + (v/1000).toFixed(0) + 'k' },
+          grid: { color: 'rgba(255,255,255,.04)' }
+        }
+      }
+    }
+  });
+}
+
 loadData();
 setInterval(loadData, 60000);
 </script>
@@ -1038,6 +1173,85 @@ def api_sharp_money():
         "cancelled":    cancelled,
         "neutral":      neutral,
         "avg_movement": avg_mvt,
+    })
+
+
+@app.route("/api/backtest")
+def api_backtest():
+    """
+    Backtesting sur une période donnée.
+    Params : from (YYYY-MM-DD), to (YYYY-MM-DD), sport?, market?
+    Retourne : KPIs + courbe P&L cumulé jour par jour.
+    """
+    import math, sqlite3
+    from config import DB_PATH
+
+    date_from = request.args.get("from", "2020-01-01")
+    date_to   = request.args.get("to",   "2099-12-31")
+    sport     = request.args.get("sport",  "")
+    market    = request.args.get("market", "")
+
+    where  = ["outcome IS NOT NULL", "kelly_stake > 0"]
+    params = []
+    where.append("DATE(match_date) >= ?"); params.append(date_from)
+    where.append("DATE(match_date) <= ?"); params.append(date_to)
+    if sport:
+        where.append("sport = ?"); params.append(sport)
+    if market:
+        where.append("COALESCE(market,'1X2') = ?"); params.append(market)
+
+    sql_where = " AND ".join(where)
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # Agrégat global
+    agg = conn.execute(f"""
+        SELECT COUNT(*) AS bets,
+               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+               COALESCE(SUM(pnl), 0) AS pnl,
+               COALESCE(SUM(kelly_stake), 0) AS staked,
+               AVG(
+                 (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
+                 (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
+               ) AS brier
+        FROM predictions WHERE {sql_where}
+    """, params).fetchone()
+
+    # Courbe P&L par date
+    curve_rows = conn.execute(f"""
+        SELECT DATE(match_date) AS d, SUM(pnl) AS daily_pnl
+        FROM predictions
+        WHERE {sql_where}
+        GROUP BY DATE(match_date)
+        ORDER BY DATE(match_date)
+    """, params).fetchall()
+    conn.close()
+
+    bets, wins, pnl, staked, brier = agg
+    bets   = int(bets or 0)
+    wins   = int(wins or 0)
+    pnl    = float(pnl or 0)
+    staked = float(staked or 0)
+    roi    = round(pnl / staked * 100, 2) if staked else 0.0
+    wr     = round(wins / bets * 100, 1) if bets else 0.0
+
+    # Courbe cumulative
+    cumul = 0.0
+    curve = []
+    for d, daily in curve_rows:
+        cumul += float(daily or 0)
+        curve.append({"date": d, "daily_pnl": round(float(daily or 0), 0),
+                      "cumulative_pnl": round(cumul, 0)})
+
+    return jsonify({
+        "bets":     bets,
+        "wins":     wins,
+        "losses":   bets - wins,
+        "win_rate": wr,
+        "pnl":      round(pnl, 0),
+        "roi":      roi,
+        "brier":    round(float(brier), 4) if brier is not None else None,
+        "curve":    curve,
     })
 
 

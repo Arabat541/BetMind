@@ -10,7 +10,8 @@ import pickle
 class EnsembleModel:
     """
     Stacking : XGBoost + LightGBM comme base-learners,
-    Logistic Regression comme méta-modèle.
+    Logistic Regression comme méta-modèle,
+    + calibration isotonic par classe (Platt scaling multiclass).
 
     Interface sklearn : predict_proba(X) → probas [H, D, A]
     """
@@ -22,6 +23,7 @@ class EnsembleModel:
         self.meta_model = meta_model
         self.n_classes  = n_classes
         self.classes_   = list(range(n_classes))
+        self.cal_models = None   # list[IsotonicRegression] par classe, None = pas de calibration
 
     def _stack(self, X) -> np.ndarray:
         """Concatène les probas XGB + LGB → méta-features."""
@@ -31,7 +33,37 @@ class EnsembleModel:
 
     def predict_proba(self, X) -> np.ndarray:
         meta_X = self._stack(X)
-        return self.meta_model.predict_proba(meta_X)
+        probas = self.meta_model.predict_proba(meta_X)   # (n, 3)
+
+        if self.cal_models is not None:
+            probas = self._apply_calibration(probas)
+
+        return probas
+
+    def _apply_calibration(self, probas: np.ndarray) -> np.ndarray:
+        """Applique la calibration isotonic par classe puis renormalise."""
+        calibrated = np.column_stack([
+            self.cal_models[c].predict(probas[:, c])
+            for c in range(self.n_classes)
+        ])
+        # Clamp et renormalise pour que les probas somment à 1
+        calibrated = np.clip(calibrated, 1e-6, 1.0)
+        calibrated /= calibrated.sum(axis=1, keepdims=True)
+        return calibrated
+
+    def calibrate(self, oof_probas: np.ndarray, y: np.ndarray) -> None:
+        """
+        Ajuste une IsotonicRegression par classe sur les probas OOF.
+        oof_probas : (n_samples, n_classes) — sortie brute du méta-modèle sur OOF
+        y          : (n_samples,) — labels vrais (entiers 0/1/2)
+        """
+        from sklearn.isotonic import IsotonicRegression
+        self.cal_models = []
+        for c in range(self.n_classes):
+            y_bin = (y == c).astype(float)
+            ir = IsotonicRegression(out_of_bounds="clip")
+            ir.fit(oof_probas[:, c], y_bin)
+            self.cal_models.append(ir)
 
     def predict(self, X) -> np.ndarray:
         return np.argmax(self.predict_proba(X), axis=1)

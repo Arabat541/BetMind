@@ -433,6 +433,81 @@ class BankrollTracker:
             "streak_val":      streak_val,
         }
 
+    def get_league_recent_stats(self, league: str, n_recent: int = 10) -> dict:
+        """
+        Stats des N derniers paris réglés pour une ligue donnée.
+        Retourne : bets, wins, losses, pnl, roi, consecutive_losses
+        """
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT pnl, kelly_stake
+            FROM predictions
+            WHERE outcome IS NOT NULL
+              AND kelly_stake > 0
+              AND league = ?
+            ORDER BY match_date DESC
+            LIMIT ?
+        """, (league, n_recent)).fetchall()
+        conn.close()
+
+        if not rows:
+            return {"bets": 0, "wins": 0, "losses": 0, "pnl": 0.0, "roi": 0.0, "consecutive_losses": 0}
+
+        pnls   = [float(r[0]) for r in rows]
+        stakes = [float(r[1]) for r in rows]
+        wins   = sum(1 for p in pnls if p > 0)
+        losses = len(pnls) - wins
+        pnl    = sum(pnls)
+        staked = sum(stakes)
+        roi    = round(pnl / staked * 100, 2) if staked > 0 else 0.0
+
+        # Série de défaites consécutives (depuis le match le plus récent)
+        consec_losses = 0
+        for p in pnls:
+            if p < 0:
+                consec_losses += 1
+            else:
+                break
+
+        return {
+            "bets": len(pnls), "wins": wins, "losses": losses,
+            "pnl": round(pnl, 0), "roi": roi,
+            "consecutive_losses": consec_losses,
+        }
+
+    def is_league_suspended(self, league: str,
+                            min_bets: int = 5,
+                            max_consec_losses: int = 5,
+                            min_roi_threshold: float = -20.0) -> tuple[bool, str]:
+        """
+        Décide si une ligue doit être suspendue temporairement.
+
+        Critères (sur les 10 derniers paris réglés) :
+          - ≥ 5 défaites consécutives → suspension
+          - ROI < -20% sur 10 paris → suspension
+
+        Returns:
+            (suspended: bool, reason: str)
+        """
+        stats = self.get_league_recent_stats(league, n_recent=10)
+
+        if stats["bets"] < min_bets:
+            return False, ""   # Pas assez de données pour décider
+
+        if stats["consecutive_losses"] >= max_consec_losses:
+            reason = (f"Stop-loss ligue : {stats['consecutive_losses']} défaites "
+                      f"consécutives en {league}")
+            logger.warning(reason)
+            return True, reason
+
+        if stats["roi"] < min_roi_threshold:
+            reason = (f"Stop-loss ligue : ROI {stats['roi']}% < {min_roi_threshold}% "
+                      f"sur {stats['bets']} derniers paris en {league}")
+            logger.warning(reason)
+            return True, reason
+
+        return False, ""
+
     def performance_summary(self) -> pd.DataFrame:
         """Résumé de performance par sport/ligue."""
         df = self._get_settled_bets()

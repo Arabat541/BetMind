@@ -20,7 +20,7 @@ from data_fetcher import (
     get_fd_quota_used, count_active_bets_for_league, get_team_exposure,
 )
 from feature_engineering import build_football_features, build_nba_features
-from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet
+from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage
 from bankroll import BankrollTracker, recommended_stake
 from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert
 
@@ -95,6 +95,12 @@ def run_football_predictions():
                 )
                 continue
 
+            # ── Stop-loss dynamique par ligue — O ────────────
+            suspended, susp_reason = tracker.is_league_suspended(fix["league"])
+            if suspended:
+                logger.warning(f"⛔ Ligue suspendue — {susp_reason}. Skip {fix['home_team']} vs {fix['away_team']}.")
+                continue
+
             remaining = daily_limit - daily_staked
             if remaining <= 0:
                 logger.info(f"Limite journalière atteinte ({daily_staked:,.0f}/{daily_limit:,.0f} FCFA). Arrêt football.")
@@ -158,6 +164,32 @@ def run_football_predictions():
 
             if _should_alert(signal):
                 send_prediction_alert(signal, stake_info)
+
+            # ── Arbitrage / implied value multi-bookmakers — M ─
+            try:
+                bk_odds = odds_row if isinstance(odds_row, dict) else {}
+                if bk_odds:
+                    # The Odds API retourne parfois plusieurs bookmakers dans odds_row
+                    # On tente detect_implied_value sur les cotes disponibles
+                    model_proba = {
+                        "H": signal.get("prob_home", 0),
+                        "D": signal.get("prob_draw", 0),
+                        "A": signal.get("prob_away", 0),
+                    }
+                    # Construit un dict multi-bk à partir des champs odd_H/odd_D/odd_A
+                    bk_dict = {"bookmaker_1": {
+                        "H": float(bk_odds.get("odd_H") or bk_odds.get("home_odd") or 0),
+                        "D": float(bk_odds.get("odd_D") or bk_odds.get("draw_odd") or 0),
+                        "A": float(bk_odds.get("odd_A") or bk_odds.get("away_odd") or 0),
+                    }}
+                    implied_vbs = detect_implied_value(model_proba, bk_dict, min_edge=0.03)
+                    if implied_vbs:
+                        logger.info(
+                            f"  [Multi-BK] {len(implied_vbs)} value(s) détectée(s) : "
+                            + ", ".join(f"{v['outcome']} edge={v['edge']:.1%} @ {v['best_odd']}" for v in implied_vbs)
+                        )
+            except Exception:
+                pass
 
             # ── Signal Asian Handicap -0.5 — K ───────────────
             if football_model.is_trained and daily_staked < daily_limit and signal:

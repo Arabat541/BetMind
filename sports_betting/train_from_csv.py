@@ -720,6 +720,7 @@ def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleM
         "verbose":          -1,
     }
 
+    oof_meta_probas = np.zeros((n, n_cls))   # probas méta OOF pour calibration
     fold_accs = []
     for fold, (tr_idx, val_idx) in enumerate(tss.split(X)):
         X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
@@ -743,6 +744,9 @@ def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleM
     meta_model = LogisticRegression(C=1.0, max_iter=500, random_state=42)
     meta_model.fit(meta_X, y)
 
+    # OOF probas du méta-modèle (pour calibration isotonic)
+    oof_meta_probas = meta_model.predict_proba(meta_X)
+
     # Base-learners finaux sur tout le dataset
     logger.info("Entraînement des base-learners finaux (toutes données)...")
     xgb_final = XGBClassifier(**xgb_params)
@@ -756,8 +760,14 @@ def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleM
         meta_model=meta_model,
         n_classes=n_cls,
     )
+
+    # Calibration isotonic par classe sur les OOF probas du méta-modèle
+    logger.info("Calibration isotonic par classe (OOF)...")
+    ensemble.calibrate(oof_meta_probas, y.values)
+    logger.info("  Calibration OK — probas corrigées par IsotonicRegression × 3 classes")
+
     ensemble.save(ENSEMBLE_PATH)
-    logger.info(f"Ensemble sauvegardé : {ENSEMBLE_PATH}")
+    logger.info(f"Ensemble calibré sauvegardé : {ENSEMBLE_PATH}")
     return ensemble
 
 
