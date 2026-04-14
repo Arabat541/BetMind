@@ -114,7 +114,9 @@ def send_bankroll_alert(balance: float, threshold: float):
     send_message("\n".join(lines))
 
 
-def send_weekly_summary(stats: dict):
+def send_weekly_summary(stats: dict, weekly_stats: dict = None,
+                        conf_stats: list = None, clv_stats: dict = None,
+                        brier_stats: dict = None):
     """Résumé hebdomadaire des performances envoyé chaque lundi."""
     balance  = stats.get("balance", 0)
     roi      = stats.get("roi", 0)
@@ -128,18 +130,121 @@ def send_weekly_summary(stats: dict):
     roi_emoji = "📈" if roi >= 0 else "📉"
     pnl_sign  = "+" if pnl >= 0 else ""
 
-    lines = [
-        f"📊 <b>RÉSUMÉ HEBDOMADAIRE</b>",
+    lines = ["📊 <b>RÉSUMÉ HEBDOMADAIRE</b>", ""]
+
+    # ── Stats de la semaine écoulée ──────────────────────────
+    if weekly_stats:
+        roi_w    = weekly_stats.get("roi", 0)
+        pnl_w    = weekly_stats.get("pnl", 0)
+        bets_w   = weekly_stats.get("bets", 0)
+        wins_w   = weekly_stats.get("wins", 0)
+        losses_w = weekly_stats.get("losses", 0)
+        wr_w     = weekly_stats.get("win_rate", 0)
+
+        roi_emoji_w = "📈" if roi_w >= 0 else "📉"
+        pnl_sign_w  = "+" if pnl_w >= 0 else ""
+
+        lines += [
+            "📅 <b>7 derniers jours</b>",
+            f"  🎯 {bets_w} paris  |  {wins_w}W / {losses_w}L  ({wr_w:.1f}%)",
+            f"  {roi_emoji_w} ROI semaine : <b>{roi_w:+.2f}%</b>",
+            f"  💵 P&amp;L : {pnl_sign_w}{pnl_w:,.0f} FCFA",
+        ]
+
+        best_league     = weekly_stats.get("best_league")
+        best_league_pnl = weekly_stats.get("best_league_pnl", 0)
+        if best_league:
+            sign_lg = "+" if best_league_pnl >= 0 else ""
+            lines.append(f"  🏆 Ligue + rentable : {best_league} ({sign_lg}{best_league_pnl:,.0f} FCFA)")
+
+        best_bet = weekly_stats.get("best_bet")
+        if best_bet:
+            lines.append(
+                f"  🔥 Meilleur pari : {best_bet['match']}"
+                f" (+{best_bet['pnl']:,.0f} FCFA @ {best_bet['odd']:.2f})"
+            )
+
+        streak_type = weekly_stats.get("streak_type")
+        streak_val  = weekly_stats.get("streak_val", 0)
+        if streak_type and streak_val >= 2:
+            streak_emoji = "🔥" if streak_type == "W" else "❄️"
+            streak_label = "victoires" if streak_type == "W" else "défaites"
+            lines.append(f"  {streak_emoji} Série : {streak_val} {streak_label} consécutives")
+
+        lines.append("")
+
+    # ── Closing Line Value ───────────────────────────────────
+    if clv_stats:
+        avg_clv   = clv_stats.get("avg_clv", 0)
+        beat_rate = clv_stats.get("beat_rate", 0)
+        n_clv     = clv_stats.get("n_bets", 0)
+        clv_emoji = "📈" if avg_clv > 0 else "📉"
+        clv_verdict = "Edge confirmé ✓" if avg_clv > 0 else "Marché nous devance ⚠️"
+        lines += [
+            "📐 <b>Closing Line Value</b>",
+            f"  {clv_emoji} CLV moyen : <b>{avg_clv:+.2f}%</b>  ({n_clv} paris)",
+            f"  🎯 Beat rate : {beat_rate:.1f}%  — {clv_verdict}",
+            "",
+        ]
+
+    # ── ROI par tranche de confiance ─────────────────────────
+    if conf_stats:
+        lines.append("🎯 <b>ROI par confiance</b>")
+        tier_map = {d["tier"]: d for d in conf_stats}
+        for tier in ("<55%", "55-65%", ">65%"):
+            d = tier_map.get(tier)
+            if not d:
+                continue
+            roi   = d["roi"]
+            sign  = "+" if roi >= 0 else ""
+            emoji = "📈" if roi >= 0 else "📉"
+            lines.append(
+                f"  {emoji} {tier:>6}  {sign}{roi:.2f}%"
+                f"  ({d['bets']} paris, {d['win_rate']:.0f}% WR)"
+            )
+        # Alerte si calibration inversée
+        low  = tier_map.get("<55%",  {}).get("roi", 0)
+        high = tier_map.get(">65%",  {}).get("roi", 0)
+        if len(conf_stats) >= 2 and high < low:
+            lines.append("  ⚠️ Calibration à vérifier : confiance >65% < <55%")
+        lines.append("")
+
+    # ── Brier Score (calibration post-déploiement) ──────────
+    if brier_stats:
+        bs    = brier_stats.get("score", 0)
+        n_bs  = brier_stats.get("n", 0)
+        if bs < 0.20:
+            bs_verdict = "Calibration excellente ✓"
+            bs_emoji   = "🟢"
+        elif bs < 0.25:
+            bs_verdict = "Calibration correcte ✓"
+            bs_emoji   = "🟡"
+        elif bs < 0.28:
+            bs_verdict = "Calibration acceptable ⚠️"
+            bs_emoji   = "🟠"
+        else:
+            bs_verdict = "Modèle sous-calibré — retraining conseillé ❌"
+            bs_emoji   = "🔴"
+        lines += [
+            "📐 <b>Brier Score (calibration)</b>",
+            f"  {bs_emoji} BS = <b>{bs:.4f}</b>  ({n_bs} paris réglés)",
+            f"  → {bs_verdict}",
+            "  <i>Références : &lt;0.20 excellent | 0.25 naïf (50/50) | &gt;0.28 alerte</i>",
+            "",
+        ]
+
+    # ── Stats cumulées ───────────────────────────────────────
+    lines += [
+        "📊 <b>Cumulé</b>",
+        f"  💰 Bankroll : <b>{balance:,.0f} FCFA</b>",
+        f"  📊 Départ : {INITIAL_BANKROLL:,.0f} FCFA  |  {'+' if variation >= 0 else ''}{variation:,.0f} FCFA",
         "",
-        f"💰 Bankroll : <b>{balance:,.0f} FCFA</b>",
-        f"   Départ : {INITIAL_BANKROLL:,.0f} FCFA  |  {'+' if variation >= 0 else ''}{variation:,.0f} FCFA",
+        f"  {roi_emoji} ROI global    : {roi:+.2f}%",
+        f"  💵 P&amp;L total      : {pnl_sign}{pnl:,.0f} FCFA",
         "",
-        f"{roi_emoji} <b>ROI global</b>    : {roi:+.2f}%",
-        f"💵 P&amp;L total      : {pnl_sign}{pnl:,.0f} FCFA",
-        "",
-        f"🎯 Paris joués  : {total}",
-        f"✅ Gagnés       : {wins}  ({win_rate:.1f}%)",
-        f"❌ Perdus       : {losses}",
+        f"  🎯 Paris joués  : {total}",
+        f"  ✅ Gagnés       : {wins}  ({win_rate:.1f}%)",
+        f"  ❌ Perdus       : {losses}",
         "",
         "🤖 BetMind Agent"
     ]
@@ -185,6 +290,72 @@ def send_daily_summary(stats: dict, today_stats: dict = None):
         f"  📈 ROI : {roi:+.2f}%  |  P&L : {pnl:+,.0f} FCFA",
         "",
         "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_odds_movement_alert(home_team: str, away_team: str, league: str,
+                             pred_result: str, odd_saved: float,
+                             odd_current: float, drop_pct: float):
+    """Alerte Telegram quand une cote a trop bougé et qu'une mise est annulée."""
+    NAMES = {"H": "Domicile", "D": "Nul", "A": "Extérieur",
+             "O": "Over 2.5", "U": "Under 2.5"}
+    sport_emoji = "⚽" if pred_result in ("H", "D", "A", "O", "U") else "🏀"
+    lines = [
+        f"📉 <b>COTE BOUGÉE — MISE ANNULÉE</b>",
+        "",
+        f"{sport_emoji} <b>{home_team} vs {away_team}</b>",
+        f"🏆 {league}",
+        "",
+        f"Pari visé     : {NAMES.get(pred_result, pred_result)}",
+        f"Cote initiale : {odd_saved:.2f}",
+        f"Cote actuelle : <b>{odd_current:.2f}</b>  (−{drop_pct:.1%})",
+        "",
+        "⚠️ Signal de sharp money détecté.",
+        "La mise a été annulée automatiquement.",
+        "",
+        "🤖 BetMind Agent"
+    ]
+    send_message("\n".join(lines))
+
+
+def send_stop_loss_alert(pnl: float, bankroll: float, threshold_pct: float):
+    """Alerte Telegram quand le stop-loss journalier est déclenché."""
+    threshold_fcfa = bankroll * threshold_pct
+    lines = [
+        "🛑 <b>STOP-LOSS DÉCLENCHÉ</b>",
+        "",
+        f"📉 P&amp;L récent (48h) : <b>{pnl:+,.0f} FCFA</b>",
+        f"⚠️  Seuil            : -{threshold_pct:.0%} bankroll  ({threshold_fcfa:,.0f} FCFA)",
+        f"💰 Bankroll actuel  : {bankroll:,.0f} FCFA",
+        "",
+        "Aucune nouvelle mise aujourd'hui.",
+        "Le bot reprendra automatiquement demain.",
+        "",
+        "🤖 BetMind Agent"
+    ]
+    send_message("\n".join(lines))
+
+
+def send_model_drift_alert(win_rate: float, n_bets: int):
+    """Alerte Telegram si le win rate récent chute sous 30% (dérive potentielle)."""
+    lines = [
+        "⚠️ <b>ALERTE : DÉRIVE DU MODÈLE</b>",
+        "",
+        f"📉 Win rate sur les {n_bets} derniers paris réglés : <b>{win_rate:.1f}%</b>",
+        f"🎯 Seuil d'alerte : 30%",
+        "",
+        "Causes possibles :",
+        "  • Données d'entraînement obsolètes (marché a changé)",
+        "  • Changement structurel dans les ligues suivies",
+        "  • Sur-ajustement du modèle (overfitting)",
+        "",
+        "Actions recommandées :",
+        "  • Relancer l'entraînement : <code>train_from_csv.py</code>",
+        "  • Suspendre temporairement les mises",
+        "  • Vérifier les seuils d'edge dans config.py",
+        "",
+        "🤖 BetMind Agent"
     ]
     send_message("\n".join(lines))
 

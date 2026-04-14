@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 from data_fetcher import (
     fetch_team_stats, fetch_h2h, fetch_standings, get_team_standing,
-    fetch_nba_team_stats, get_injury_stats
+    fetch_nba_team_stats, get_injury_stats, get_team_shots_stats,
+    fetch_match_weather,
 )
 from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
 
@@ -20,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 def build_football_features(home_id: int, away_id: int,
                              league_code: str = "", home_name: str = "",
-                             away_name: str = "") -> dict | None:
+                             away_name: str = "",
+                             league_name: str = "") -> dict | None:
     """
     Construit le vecteur de features pour un match de foot.
     Retourne None si les données sont insuffisantes.
@@ -113,6 +115,40 @@ def build_football_features(home_id: int, away_id: int,
     features["away_lambda"] = round(max(away_lambda, 0.1), 4)
     features["total_goals_exp"] = round(home_lambda + away_lambda, 4)
 
+    # ── Shots (proxy xG) — A ─────────────────────────────────
+    home_sh = get_team_shots_stats(home_name, league_name)
+    away_sh = get_team_shots_stats(away_name, league_name)
+    features.update({
+        "home_sot_avg":    home_sh["sot_avg"],
+        "away_sot_avg":    away_sh["sot_avg"],
+        "home_sot_ag_avg": home_sh["sot_ag_avg"],
+        "away_sot_ag_avg": away_sh["sot_ag_avg"],
+        "home_shots_avg":  home_sh["shots_avg"],
+        "away_shots_avg":  away_sh["shots_avg"],
+        "home_sot_ratio":  home_sh["sot_ratio"],
+        "away_sot_ratio":  away_sh["sot_ratio"],
+    })
+
+    # ── Fatigue / calendrier — E ─────────────────────────────
+    features.update({
+        "home_days_since_last": home_stats.get("days_since_last_match", 7),
+        "away_days_since_last": away_stats.get("days_since_last_match", 7),
+        "home_fatigue":         home_stats.get("matches_last_10days", 1),
+        "away_fatigue":         away_stats.get("matches_last_10days", 1),
+    })
+
+    # ── Motivation / enjeu — G ───────────────────────────────
+    features.update({
+        "home_relegation_gap": home_std.get("relegation_gap", 0.0),
+        "away_relegation_gap": away_std.get("relegation_gap", 0.0),
+        "home_title_gap":      home_std.get("title_gap", 0.5),
+        "away_title_gap":      away_std.get("title_gap", 0.5),
+    })
+
+    # ── Météo — J ────────────────────────────────────────────
+    weather = fetch_match_weather(home_name)
+    features["rainy_match"] = float(weather["rainy_match"])
+
     return features
 
 
@@ -172,7 +208,7 @@ def _compute_h2h_features(h2h_df: pd.DataFrame, home_id: int) -> dict:
 
 def build_nba_features(home_id: int, away_id: int,
                         home_name: str = "", away_name: str = "",
-                        injuries_dict: dict = None) -> dict | None:
+                        injuries_dict: dict | None = None) -> dict | None:
     """
     Construit le vecteur de features pour un match NBA.
     """
@@ -254,6 +290,19 @@ def get_feature_columns(sport: str = "football") -> list:
             "h2h_home_win_rate", "h2h_draw_rate", "h2h_away_win_rate",
             "h2h_avg_goals", "h2h_matches",
             "home_lambda", "away_lambda", "total_goals_exp",
+            # Shots (proxy xG) — A
+            "home_sot_avg", "away_sot_avg",
+            "home_sot_ag_avg", "away_sot_ag_avg",
+            "home_shots_avg", "away_shots_avg",
+            "home_sot_ratio", "away_sot_ratio",
+            # Fatigue — E
+            "home_days_since_last", "away_days_since_last",
+            "home_fatigue",         "away_fatigue",
+            # Motivation — G
+            "home_relegation_gap", "away_relegation_gap",
+            "home_title_gap",      "away_title_gap",
+            # Météo — J
+            "rainy_match",
         ]
     elif sport == "ou_football":
         return [
@@ -264,6 +313,26 @@ def get_feature_columns(sport: str = "football") -> list:
             "home_scoring_rate",  "away_scoring_rate",
             "home_lambda",        "away_lambda",
             "total_goals_exp",    "h2h_avg_goals",
+            # Shots (proxy xG) — A
+            "home_sot_avg", "away_sot_avg",
+            "home_sot_ag_avg", "away_sot_ag_avg",
+            # Fatigue — E
+            "home_days_since_last", "away_days_since_last",
+            "home_fatigue",         "away_fatigue",
+        ]
+    elif sport == "btts_football":
+        return [
+            "home_goals_for_avg", "home_goals_ag_avg",
+            "away_goals_for_avg", "away_goals_ag_avg",
+            "home_attack_str",    "home_defense_str",
+            "away_attack_str",    "away_defense_str",
+            "home_scoring_rate",  "away_scoring_rate",
+            "home_clean_sheet_rate", "away_clean_sheet_rate",
+            "h2h_avg_goals",      "btts_h2h_rate",
+            "home_sot_avg",       "away_sot_avg",
+            "home_sot_ag_avg",    "away_sot_ag_avg",
+            "home_days_since_last", "away_days_since_last",
+            "home_fatigue",         "away_fatigue",
         ]
     elif sport == "nba":
         return [

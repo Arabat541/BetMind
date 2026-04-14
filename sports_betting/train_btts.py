@@ -1,7 +1,8 @@
 # ============================================================
-# train_over_under.py — Entraînement modèle Over/Under 2.5
-# Source : football-data.co.uk (mêmes CSV que train_from_csv.py)
-# Cible binaire : FTHG + FTAG > 2 → 1 (Over 2.5), sinon 0 (Under)
+# train_btts.py — Entraînement modèle BTTS (Both Teams To Score)
+# Source : football-data.co.uk (mêmes CSV que train_over_under.py)
+# Cible binaire : FTHG > 0 ET FTAG > 0 → 1 (BTTS), sinon 0
+# Edge : bookmakers calibrent moins ce marché que le 1X2
 # ============================================================
 
 import io
@@ -28,13 +29,9 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from config import MODELS_DIR
-from feature_engineering import get_feature_columns
 
-FEATURE_COLS = get_feature_columns("ou_football")
-import numpy as np
-MODEL_PATH   = os.path.join(MODELS_DIR, "ou_football_xgb_model.pkl")
-BASE_URL     = "https://www.football-data.co.uk/mmz4281"
-AVG_GOALS    = 2.5
+MODEL_PATH = os.path.join(MODELS_DIR, "btts_football_xgb_model.pkl")
+BASE_URL   = "https://www.football-data.co.uk/mmz4281"
 
 LEAGUES = {
     "Ligue 1":        "F1",
@@ -44,6 +41,22 @@ LEAGUES = {
     "Bundesliga":     "D1",
 }
 SEASONS = ["2425", "2324", "2223", "2122"]
+
+FEATURE_COLS = [
+    "home_goals_for_avg", "home_goals_ag_avg",
+    "away_goals_for_avg", "away_goals_ag_avg",
+    "home_attack_str", "home_defense_str",
+    "away_attack_str", "away_defense_str",
+    "home_scoring_rate", "away_scoring_rate",
+    "home_clean_sheet_rate", "away_clean_sheet_rate",
+    "h2h_avg_goals", "btts_h2h_rate",
+    "home_sot_avg", "away_sot_avg",
+    "home_sot_ag_avg", "away_sot_ag_avg",
+    "home_days_since_last", "away_days_since_last",
+    "home_fatigue", "away_fatigue",
+]
+
+AVG_GOALS = 2.5
 
 
 # ════════════════════════════════════════════════════════════
@@ -69,7 +82,7 @@ def download_csv(league_code: str, season: str) -> pd.DataFrame | None:
 
 
 # ════════════════════════════════════════════════════════════
-# CONSTRUCTION DES FEATURES
+# STATS PAR ÉQUIPE
 # ════════════════════════════════════════════════════════════
 
 def team_stats_before(all_df: pd.DataFrame, team: str, date, n: int = 15) -> dict:
@@ -78,60 +91,47 @@ def team_stats_before(all_df: pd.DataFrame, team: str, date, n: int = 15) -> dic
         (all_df["Date"] < date)
     )
     past = all_df[mask].sort_values("Date").tail(n)
-    if past.empty:
+    if len(past) < 5:
         return {}
 
-    goals_for, goals_ag, home_form, away_form = [], [], [], []
-    sot_for, sot_ag_l = [], []
+    goals_for, goals_ag = [], []
+    sot_for, sot_ag_l   = [], []
+    btts_results        = []
+
     for _, m in past.iterrows():
         is_home = m["HomeTeam"] == team
         gf = int(m["FTHG"]) if is_home else int(m["FTAG"])
         ga = int(m["FTAG"]) if is_home else int(m["FTHG"])
         goals_for.append(gf)
         goals_ag.append(ga)
-        res = "W" if gf > ga else ("D" if gf == ga else "L")
-        if is_home:
-            home_form.append(res)
-        else:
-            away_form.append(res)
-        # Shots on target
+        btts_results.append(1 if gf > 0 and ga > 0 else 0)
+
         if "HST" in m.index and pd.notna(m.get("HST")):
             sot_for.append(float(m["HST"]) if is_home else float(m.get("AST", 0) or 0))
             sot_ag_l.append(float(m.get("AST", 0) or 0) if is_home else float(m["HST"]))
 
-    n_total = len(goals_for)
-
-    def form_score(chars, window=5):
-        recent = chars[-window:] if len(chars) >= window else chars
-        if not recent:
-            return 0.5
-        return sum(3 if c == "W" else (1 if c == "D" else 0) for c in recent) / (len(recent) * 3)
-
-    gf_avg = sum(goals_for) / n_total
-    ga_avg = sum(goals_ag)  / n_total
-    failed = sum(1 for g in goals_for if g == 0)
-
-    # Fatigue
-    today = pd.Timestamp.now()
+    n_total    = len(goals_for)
+    failed     = sum(1 for g in goals_for if g == 0)
+    cs         = sum(1 for g in goals_ag  if g == 0)
+    today      = pd.Timestamp.now()
     dates_seen = list(past["Date"])
     last_date  = max(dates_seen) if dates_seen else today - pd.Timedelta(days=7)
-    days_since = max(0, (today - last_date).days)
-    fatigue    = sum(1 for d in dates_seen if (today - d).days <= 10)
 
     return {
-        "goals_for_avg":  round(gf_avg, 4),
-        "goals_ag_avg":   round(ga_avg, 4),
-        "scoring_rate":   round(1 - failed / n_total, 4),
-        "home_form":      round(form_score(home_form), 4),
-        "away_form":      round(form_score(away_form), 4),
-        "sot_avg":        round(sum(sot_for) / len(sot_for), 4) if sot_for else 0.0,
-        "sot_ag_avg":     round(sum(sot_ag_l) / len(sot_ag_l), 4) if sot_ag_l else 0.0,
-        "days_since":     days_since,
-        "fatigue":        fatigue,
+        "goals_for_avg":     round(sum(goals_for) / n_total, 4),
+        "goals_ag_avg":      round(sum(goals_ag)  / n_total, 4),
+        "scoring_rate":      round(1 - failed / n_total, 4),
+        "clean_sheet_rate":  round(cs / n_total, 4),
+        "btts_rate":         round(sum(btts_results) / n_total, 4),
+        "sot_avg":           round(sum(sot_for)  / len(sot_for),  4) if sot_for  else 0.0,
+        "sot_ag_avg":        round(sum(sot_ag_l) / len(sot_ag_l), 4) if sot_ag_l else 0.0,
+        "days_since":        max(0, (today - last_date).days),
+        "fatigue":           sum(1 for d in dates_seen if (today - d).days <= 10),
     }
 
 
-def h2h_avg_goals(all_df: pd.DataFrame, home: str, away: str, date, last_n: int = 10) -> float:
+def h2h_btts_stats(all_df: pd.DataFrame, home: str, away: str,
+                   date, last_n: int = 10) -> dict:
     mask = (
         (((all_df["HomeTeam"] == home) & (all_df["AwayTeam"] == away)) |
          ((all_df["HomeTeam"] == away) & (all_df["AwayTeam"] == home))) &
@@ -139,8 +139,15 @@ def h2h_avg_goals(all_df: pd.DataFrame, home: str, away: str, date, last_n: int 
     )
     past = all_df[mask].sort_values("Date").tail(last_n)
     if past.empty:
-        return 2.5
-    return round((past["FTHG"] + past["FTAG"]).mean(), 4)
+        return {"h2h_avg_goals": 2.5, "btts_h2h_rate": 0.5}
+
+    total_goals = (past["FTHG"] + past["FTAG"]).sum()
+    btts_count  = ((past["FTHG"] > 0) & (past["FTAG"] > 0)).sum()
+    n = len(past)
+    return {
+        "h2h_avg_goals": round(total_goals / n, 4),
+        "btts_h2h_rate": round(btts_count / n, 4),
+    }
 
 
 def build_features(row: pd.Series, all_df: pd.DataFrame) -> dict | None:
@@ -155,34 +162,32 @@ def build_features(row: pd.Series, all_df: pd.DataFrame) -> dict | None:
     home_defense = hs["goals_ag_avg"]  / max(avg, 0.1)
     away_attack  = as_["goals_for_avg"] / max(avg, 0.1)
     away_defense = as_["goals_ag_avg"]  / max(avg, 0.1)
-    home_lambda  = max(home_attack * away_defense * avg, 0.1)
-    away_lambda  = max(away_attack * home_defense * avg, 0.1)
+
+    h2h = h2h_btts_stats(all_df, home, away, date)
 
     return {
-        "home_goals_for_avg": hs["goals_for_avg"],
-        "home_goals_ag_avg":  hs["goals_ag_avg"],
-        "away_goals_for_avg": as_["goals_for_avg"],
-        "away_goals_ag_avg":  as_["goals_ag_avg"],
-        "home_attack_str":    round(home_attack, 4),
-        "home_defense_str":   round(home_defense, 4),
-        "away_attack_str":    round(away_attack, 4),
-        "away_defense_str":   round(away_defense, 4),
-        "home_scoring_rate":  hs["scoring_rate"],
-        "away_scoring_rate":  as_["scoring_rate"],
-        "home_lambda":        round(home_lambda, 4),
-        "away_lambda":        round(away_lambda, 4),
-        "total_goals_exp":    round(home_lambda + away_lambda, 4),
-        "h2h_avg_goals":      h2h_avg_goals(all_df, home, away, date),
-        # Shots (proxy xG) — A
-        "home_sot_avg":       hs.get("sot_avg", 0.0),
-        "away_sot_avg":       as_.get("sot_avg", 0.0),
-        "home_sot_ag_avg":    hs.get("sot_ag_avg", 0.0),
-        "away_sot_ag_avg":    as_.get("sot_ag_avg", 0.0),
-        # Fatigue — E
-        "home_days_since_last": hs.get("days_since", 7),
-        "away_days_since_last": as_.get("days_since", 7),
-        "home_fatigue":         hs.get("fatigue", 1),
-        "away_fatigue":         as_.get("fatigue", 1),
+        "home_goals_for_avg":   hs["goals_for_avg"],
+        "home_goals_ag_avg":    hs["goals_ag_avg"],
+        "away_goals_for_avg":   as_["goals_for_avg"],
+        "away_goals_ag_avg":    as_["goals_ag_avg"],
+        "home_attack_str":      round(home_attack, 4),
+        "home_defense_str":     round(home_defense, 4),
+        "away_attack_str":      round(away_attack, 4),
+        "away_defense_str":     round(away_defense, 4),
+        "home_scoring_rate":    hs["scoring_rate"],
+        "away_scoring_rate":    as_["scoring_rate"],
+        "home_clean_sheet_rate": hs["clean_sheet_rate"],
+        "away_clean_sheet_rate": as_["clean_sheet_rate"],
+        "h2h_avg_goals":        h2h["h2h_avg_goals"],
+        "btts_h2h_rate":        h2h["btts_h2h_rate"],
+        "home_sot_avg":         hs["sot_avg"],
+        "away_sot_avg":         as_["sot_avg"],
+        "home_sot_ag_avg":      hs["sot_ag_avg"],
+        "away_sot_ag_avg":      as_["sot_ag_avg"],
+        "home_days_since_last": hs["days_since"],
+        "away_days_since_last": as_["days_since"],
+        "home_fatigue":         hs["fatigue"],
+        "away_fatigue":         as_["fatigue"],
     }
 
 
@@ -193,7 +198,6 @@ def build_features(row: pd.Series, all_df: pd.DataFrame) -> dict | None:
 def train():
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # Télécharger toutes les données
     frames = []
     for league_name, code in LEAGUES.items():
         for season in SEASONS:
@@ -208,11 +212,9 @@ def train():
     all_df = pd.concat(frames, ignore_index=True).sort_values("Date").reset_index(drop=True)
     logger.info(f"Total matchs chargés : {len(all_df)}")
 
-    # Construire le dataset
     rows_X, rows_y = [], []
     for i, row in all_df.iterrows():
-        total = int(row["FTHG"]) + int(row["FTAG"])
-        label = 1 if total > 2 else 0   # Over 2.5 = 3 buts ou plus
+        label = 1 if (int(row["FTHG"]) > 0 and int(row["FTAG"]) > 0) else 0
 
         feats = build_features(row, all_df)
         if feats is None:
@@ -226,13 +228,16 @@ def train():
 
     X = pd.DataFrame(rows_X, columns=FEATURE_COLS)
     y = pd.Series(rows_y)
-    logger.info(f"Dataset : {len(X)} matchs | Over={y.sum()} ({y.mean():.1%}) | Under={len(y)-y.sum()}")
+    btts_rate = y.mean()
+    logger.info(
+        f"Dataset : {len(X)} matchs | BTTS={y.sum()} ({btts_rate:.1%}) | "
+        f"No-BTTS={len(y) - y.sum()} ({1 - btts_rate:.1%})"
+    )
 
     if len(X) < 200:
-        logger.error("Pas assez de données (< 200).")
+        logger.error("Pas assez de données.")
         sys.exit(1)
 
-    # Walk-forward validation — B
     logger.info("Walk-forward validation (TimeSeriesSplit n_splits=5)...")
     tss       = TimeSeriesSplit(n_splits=5)
     fold_accs = []
@@ -255,11 +260,10 @@ def train():
         logger.info(f"  Fold {fold + 1}: Accuracy={acc:.3f} | LogLoss={ll:.4f}")
 
     logger.info(
-        f"Walk-forward OU — Accuracy: {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f} "
+        f"Walk-forward BTTS — Accuracy: {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f} "
         f"| LogLoss: {np.mean(fold_lls):.4f}"
     )
 
-    # Modèle final sur toutes les données
     base_final = XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
@@ -268,14 +272,10 @@ def train():
     model = CalibratedClassifierCV(base_final, cv=5, method="isotonic")
     model.fit(X, y)
 
-    acc = float(np.mean(fold_accs))
-    ll  = float(np.mean(fold_lls))
-    logger.info(f"Over/Under model — Accuracy (WF): {acc:.1%} | LogLoss: {ll:.4f} | {len(FEATURE_COLS)} features")
-
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
-    logger.info(f"Modèle sauvegardé : {MODEL_PATH}")
-    return acc
+    logger.info(f"Modèle BTTS sauvegardé : {MODEL_PATH}")
+    return float(np.mean(fold_accs))
 
 
 if __name__ == "__main__":

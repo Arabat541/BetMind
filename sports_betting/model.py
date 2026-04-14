@@ -29,6 +29,12 @@ from config import (
     VALUE_BET_EDGE_HOME, VALUE_BET_EDGE_AWAY, VALUE_BET_EDGE_DRAW,
 )
 
+try:
+    from ensemble_model import EnsembleModel
+    ENSEMBLE_AVAILABLE = True
+except ImportError:
+    ENSEMBLE_AVAILABLE = False
+
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -49,20 +55,30 @@ class BettingModel:
     """
 
     def __init__(self, sport: str = "football"):
-        self.sport        = sport
-        self.model        = None
-        self.is_trained   = False
-        self.feature_cols = None  # chargé depuis le modèle pkl
-        self.model_path   = os.path.join(MODELS_DIR, f"{sport}_xgb_model.pkl")
+        self.sport         = sport
+        self.model         = None
+        self.is_trained    = False
+        self.feature_cols  = None
+        self.model_path    = os.path.join(MODELS_DIR, f"{sport}_xgb_model.pkl")
+        self.ensemble_path = os.path.join(MODELS_DIR, f"{sport}_ensemble_model.pkl")
         self._load_if_exists()
 
     def _load_if_exists(self):
+        # Prefer ensemble over single XGB model when available
+        if ENSEMBLE_AVAILABLE and os.path.exists(self.ensemble_path):
+            try:
+                self.model = EnsembleModel.load(self.ensemble_path)
+                self.is_trained = True
+                logger.info(f"Ensemble loaded: {self.ensemble_path}")
+                return
+            except Exception as e:
+                logger.warning(f"Ensemble load failed ({e}), falling back to XGB.")
+
         if os.path.exists(self.model_path):
             with open(self.model_path, "rb") as f:
                 self.model = pickle.load(f)
             self.is_trained = True
             logger.info(f"Model loaded: {self.model_path}")
-            # Récupérer les feature names depuis le modèle (sklearn >= 1.0)
             try:
                 self.feature_cols = list(self.model.feature_names_in_)
                 logger.info(f"Features: {len(self.feature_cols)}")
@@ -345,6 +361,126 @@ def build_ou_signal(features: dict, ou_odds_row: dict,
         "edge":        vb["edge"],
         "odd_used":    vb["odd"],
         "market":      "OU25",
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# ASIAN HANDICAP -0.5 (K)
+# ════════════════════════════════════════════════════════════
+
+def detect_ah_value_bet(prob_home: float, prob_away: float,
+                        prob_draw: float, ah_odds_row: dict) -> dict | None:
+    """
+    Asian Handicap -0.5 : élimine le nul → binaire H/A.
+    P(AH home win) = P(home win) / (P(home win) + P(away win))
+    Seuil edge >= 6% (marché plus efficient que 1X2 mais moins que OU).
+    """
+    if not ah_odds_row:
+        return None
+
+    AH_EDGE_MIN = 0.06
+    total_no_draw = prob_home + prob_away
+    if total_no_draw < 0.01:
+        return None
+
+    p_ah_home = prob_home / total_no_draw
+    p_ah_away = prob_away / total_no_draw
+
+    for side, p_model, odd_key in (
+        ("AH_H", p_ah_home, "odd_ah_home"),
+        ("AH_A", p_ah_away, "odd_ah_away"),
+    ):
+        odd = ah_odds_row.get(odd_key)
+        if not odd or odd <= 1.0:
+            continue
+        p_implied = round(1 / odd, 4)
+        edge      = round(p_model - p_implied, 4)
+        ev        = round(p_model * odd - 1, 4)
+
+        if edge >= AH_EDGE_MIN and ev > 0:
+            label = "Asian Handicap -0.5 Domicile" if side == "AH_H" else "Asian Handicap -0.5 Extérieur"
+            return {
+                "result":         side,
+                "result_name":    label,
+                "p_model":        round(p_model, 4),
+                "p_implied":      p_implied,
+                "edge":           edge,
+                "odd":            round(odd, 3),
+                "expected_value": ev,
+                "is_value":       True,
+            }
+    return None
+
+
+# ════════════════════════════════════════════════════════════
+# BTTS VALUE BET + SIGNAL (F)
+# ════════════════════════════════════════════════════════════
+
+def detect_btts_value_bet(prob_btts: float, btts_odds_row: dict) -> dict | None:
+    """
+    Détecte un value bet BTTS / No-BTTS.
+    Seuil edge >= 7% (même politique que OU).
+    """
+    if not btts_odds_row:
+        return None
+
+    BTTS_EDGE_MIN = 0.07
+
+    for side, p_model, odd_key in (
+        ("BTTS",    prob_btts,       "odd_btts"),
+        ("No BTTS", 1 - prob_btts,   "odd_no_btts"),
+    ):
+        odd = btts_odds_row.get(odd_key)
+        if not odd or odd <= 1.0:
+            continue
+        p_implied = round(1 / odd, 4)
+        edge      = round(p_model - p_implied, 4)
+        ev        = round(p_model * odd - 1, 4)
+
+        if edge >= BTTS_EDGE_MIN and ev > 0:
+            return {
+                "result":      side,
+                "result_name": "Les deux équipes marquent" if side == "BTTS" else "Au moins une équipe ne marque pas",
+                "p_model":     round(p_model, 4),
+                "p_implied":   p_implied,
+                "edge":        edge,
+                "odd":         round(odd, 3),
+                "expected_value": ev,
+                "is_value":    True,
+            }
+    return None
+
+
+def build_btts_signal(features: dict, btts_odds_row: dict,
+                      btts_model: "BettingModel", match_info: dict) -> dict | None:
+    """Signal BTTS pour un match de foot. Retourne None si pas de value."""
+    if not btts_model.is_trained:
+        return None
+
+    proba     = btts_model.predict_proba(features)
+    prob_btts = proba.get("prob_over", proba.get("prob_home", 0))
+    vb        = detect_btts_value_bet(prob_btts, btts_odds_row)
+    if vb is None:
+        return None
+
+    return {
+        "sport":        "football",
+        "league":       match_info.get("league", ""),
+        "home_team":    match_info.get("home_team", ""),
+        "away_team":    match_info.get("away_team", ""),
+        "match_date":   match_info.get("date", ""),
+        "pred_result":  vb["result"],
+        "pred_name":    vb["result_name"],
+        "prob_home":    prob_btts,
+        "prob_draw":    0.0,
+        "prob_away":    round(1 - prob_btts, 4),
+        "confidence":   round(vb["p_model"], 4),
+        "method":       proba.get("method", "xgboost_btts"),
+        "value_bets":   [vb],
+        "is_value_bet": True,
+        "edge":         vb["edge"],
+        "odd_used":     vb["odd"],
+        "market":       "BTTS",
     }
 
 

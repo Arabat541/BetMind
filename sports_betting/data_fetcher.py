@@ -15,7 +15,8 @@ from config import (
     FOOTBALL_DATA_KEY, FOOTBALL_DATA_BASE,
     BALLDONTLIE_BASE, ODDS_API_BASE, THE_ODDS_API_KEY,
     FOOTBALL_LEAGUES, NBA_SEASON, DATA_DIR, DB_PATH,
-    FORM_WINDOW_LONG, FD_DAILY_LIMIT
+    FORM_WINDOW_LONG, FD_DAILY_LIMIT,
+    OPENWEATHER_KEY, STADIUM_COORDS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -256,22 +257,45 @@ def fetch_team_stats(team_id: int, league_code: str = "") -> dict:
     if n == 0:
         return {}
 
+    # ── Fatigue — E ─────────────────────────────────────────
+    today        = datetime.now()
+    match_dates  = []
+    for m in matches[-15:]:
+        d_str = m.get("utcDate", "")
+        try:
+            from datetime import timezone
+            dt = datetime.fromisoformat(d_str.replace("Z", "+00:00"))
+            match_dates.append(dt.replace(tzinfo=None))
+        except Exception:
+            pass
+
+    if match_dates:
+        last_match      = max(match_dates)
+        days_since_last = max(0, (today - last_match).days)
+        matches_10days  = sum(1 for d in match_dates if (today - d).days <= 10)
+    else:
+        days_since_last = 7
+        matches_10days  = 1
+
     form_str = "".join(form_chars)
     return {
-        "team_id":         team_id,
-        "played":          n,
-        "wins":            wins,
-        "draws":           draws,
-        "losses":          losses,
-        "goals_for_avg":   round(sum(goals_for) / n, 4),
-        "goals_ag_avg":    round(sum(goals_ag) / n, 4),
-        "form_string":     form_str,
-        "form_score":      _form_to_score(form_str),
-        "form_score_long": _form_to_score(form_str, window=FORM_WINDOW_LONG),
-        "home_form_score": _form_to_score("".join(home_form_chars)),
-        "away_form_score": _form_to_score("".join(away_form_chars)),
-        "clean_sheets":    clean_sheets,
-        "failed_to_score": failed_to_score,
+        "team_id":              team_id,
+        "played":               n,
+        "wins":                 wins,
+        "draws":                draws,
+        "losses":               losses,
+        "goals_for_avg":        round(sum(goals_for) / n, 4),
+        "goals_ag_avg":         round(sum(goals_ag) / n, 4),
+        "form_string":          form_str,
+        "form_score":           _form_to_score(form_str),
+        "form_score_long":      _form_to_score(form_str, window=FORM_WINDOW_LONG),
+        "home_form_score":      _form_to_score("".join(home_form_chars)),
+        "away_form_score":      _form_to_score("".join(away_form_chars)),
+        "clean_sheets":         clean_sheets,
+        "failed_to_score":      failed_to_score,
+        # Fatigue
+        "days_since_last_match": days_since_last,
+        "matches_last_10days":   matches_10days,
     }
 
 
@@ -328,18 +352,127 @@ def fetch_standings(league_code: str) -> pd.DataFrame:
 
 
 def get_team_standing(standings_df: pd.DataFrame, team_id: int) -> dict:
-    """Retourne pts_per_game et rang d'une équipe depuis le classement."""
-    default = {"rank": 10, "pts_per_game": 1.0}
+    """Retourne pts_per_game, rang et features de motivation depuis le classement."""
+    default = {
+        "rank": 10, "pts_per_game": 1.0,
+        "relegation_gap": 0.0, "title_gap": 0.5,
+    }
     if standings_df is None or standings_df.empty:
         return default
+    n_teams = max(len(standings_df), 1)
+    rel_zone = n_teams - 3   # seuil bas de la zone de relégation
     row = standings_df[standings_df["team_id"] == team_id]
     if row.empty:
         return default
-    r = row.iloc[0]
+    r      = row.iloc[0]
     played = int(r.get("played", 1)) or 1
+    rank   = int(r.get("position", n_teams // 2))
     return {
-        "rank":         int(r.get("position", 10)),
-        "pts_per_game": round(r.get("points", 0) / played, 4),
+        "rank":            rank,
+        "pts_per_game":    round(r.get("points", 0) / played, 4),
+        # Motivation — G
+        # positif = en sécurité, négatif = en zone de relégation
+        "relegation_gap":  round((rel_zone - rank) / n_teams, 4),
+        # 0 = leader, 1 = dernier
+        "title_gap":       round((rank - 1) / n_teams, 4),
+    }
+
+
+# ── Météo (OpenWeatherMap — J) ───────────────────────────────
+_weather_cache: dict = {}
+
+def fetch_match_weather(home_team: str, match_datetime=None) -> dict:
+    """
+    Retourne les conditions météo prévues au stade du club domicile.
+    Nécessite OPENWEATHER_KEY dans .env (plan gratuit, 60 req/min).
+    Retourne rainy_match=0 si clé absente ou équipe inconnue.
+    """
+    default = {"rainy_match": 0, "rain_mm": 0.0, "wind_kmh": 0.0, "temp_c": 20.0}
+
+    if not OPENWEATHER_KEY:
+        return default
+
+    # Chercher les coords du stade (recherche partielle sur le nom)
+    coords = STADIUM_COORDS.get(home_team)
+    if not coords:
+        first_word = home_team.split()[0].lower()
+        for k, v in STADIUM_COORDS.items():
+            if k.lower().startswith(first_word):
+                coords = v
+                break
+    if not coords:
+        return default
+
+    lat, lon = coords
+    cache_key = f"{lat:.2f},{lon:.2f}"
+
+    if cache_key in _weather_cache:
+        return _weather_cache[cache_key]
+
+    try:
+        url    = "https://api.openweathermap.org/data/2.5/forecast"
+        params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_KEY,
+                  "units": "metric", "cnt": 8}   # 8 × 3h = 24h
+        resp   = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data   = resp.json()
+
+        # Prendre la prévision la plus proche de l'heure du match (ou la première)
+        entry     = data["list"][0]
+        rain_mm   = entry.get("rain", {}).get("3h", 0.0)
+        wind_ms   = entry.get("wind", {}).get("speed", 0.0)
+        wind_kmh  = round(wind_ms * 3.6, 1)
+        temp_c    = entry.get("main", {}).get("temp", 20.0)
+        rainy     = 1 if (rain_mm > 2.0 or wind_kmh > 30.0) else 0
+
+        result = {"rainy_match": rainy, "rain_mm": rain_mm,
+                  "wind_kmh": wind_kmh, "temp_c": temp_c}
+        _weather_cache[cache_key] = result
+        logger.debug(f"Météo {home_team}: pluie={rain_mm}mm vent={wind_kmh}km/h → rainy={rainy}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"fetch_match_weather({home_team}): {e}")
+        return default
+
+
+# ── Shots lookup (chargé depuis data/team_shots_current.json) ─
+_team_shots_cache: dict = {}
+
+def get_team_shots_stats(team_name: str, league: str) -> dict:
+    """
+    Retourne les moyennes de tirs de la saison courante pour une équipe.
+    Données générées par train_from_csv.py → data/team_shots_current.json.
+    Fallback : 0.0 si équipe ou fichier non trouvés.
+    """
+    global _team_shots_cache
+    if not _team_shots_cache:
+        shots_path = os.path.join(DATA_DIR, "team_shots_current.json")
+        if os.path.exists(shots_path):
+            try:
+                with open(shots_path, "r", encoding="utf-8") as f:
+                    _team_shots_cache = json.load(f)
+            except Exception:
+                _team_shots_cache = {}
+
+    league_data = _team_shots_cache.get(league, {})
+
+    # Recherche exacte puis sur premier mot (gère "Arsenal" vs "Arsenal FC")
+    team_data = league_data.get(team_name)
+    if not team_data:
+        first = team_name.split()[0].lower()
+        for k, v in league_data.items():
+            if k.lower().startswith(first):
+                team_data = v
+                break
+
+    if not team_data:
+        return {"sot_avg": 0.0, "shots_avg": 0.0, "sot_ag_avg": 0.0, "sot_ratio": 0.0}
+    return {
+        "sot_avg":    float(team_data.get("sot_avg",    0.0)),
+        "shots_avg":  float(team_data.get("shots_avg",  0.0)),
+        "sot_ag_avg": float(team_data.get("sot_ag_avg", 0.0)),
+        "sot_ratio":  float(team_data.get("sot_ratio",  0.0)),
     }
 
 
@@ -407,6 +540,75 @@ def fetch_football_ou_odds(league_key: str = "soccer_france_ligue_one") -> pd.Da
         margin = df["impl_over"] + df["impl_under"]
         df[["impl_over", "impl_under"]] = df[["impl_over", "impl_under"]].div(margin, axis=0)
     logger.info(f"OU odds fetched: {len(df)} events ({league_key})")
+    return df
+
+
+def fetch_football_ah_odds(league_key: str = "soccer_france_ligue_one") -> pd.DataFrame:
+    """
+    Cotes Asian Handicap -0.5 via The Odds API (marché 'asian_handicap').
+    AH -0.5 = équipe doit gagner (élimine le nul, binaire H/A).
+    """
+    data = _odds_get(f"sports/{league_key}/odds", {
+        "regions": "eu", "markets": "asian_handicap", "oddsFormat": "decimal"
+    })
+    rows = []
+    for event in (data if isinstance(data, list) else []):
+        home, away = event.get("home_team", ""), event.get("away_team", "")
+        for bookmaker in event.get("bookmakers", [])[:3]:
+            for market in bookmaker.get("markets", []):
+                if market["key"] != "asian_handicap":
+                    continue
+                outcomes = {}
+                for o in market["outcomes"]:
+                    point = o.get("point", 0)
+                    if abs(point + 0.5) < 0.01:    # AH -0.5 pour le favori
+                        outcomes["home_minus"] = o["price"]
+                    elif abs(point - 0.5) < 0.01:  # AH +0.5 pour l'outsider
+                        outcomes["away_plus"] = o["price"]
+                if "home_minus" in outcomes and "away_plus" in outcomes:
+                    rows.append({
+                        "event_id":     event["id"],
+                        "home_team":    home,
+                        "away_team":    away,
+                        "odd_ah_home":  outcomes["home_minus"],
+                        "odd_ah_away":  outcomes["away_plus"],
+                    })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.groupby(["event_id", "home_team", "away_team"], as_index=False).agg(
+            odd_ah_home=("odd_ah_home", "mean"),
+            odd_ah_away=("odd_ah_away", "mean"),
+        )
+    logger.info(f"AH odds fetched: {len(df)} events ({league_key})")
+    return df
+
+
+def fetch_football_btts_odds(league_key: str = "soccer_france_ligue_one") -> pd.DataFrame:
+    """Cotes BTTS (Both Teams To Score) via The Odds API (marché 'both_teams_to_score')."""
+    data = _odds_get(f"sports/{league_key}/odds", {
+        "regions": "eu", "markets": "both_teams_to_score", "oddsFormat": "decimal"
+    })
+    rows = []
+    for event in (data if isinstance(data, list) else []):
+        home, away = event.get("home_team", ""), event.get("away_team", "")
+        for bookmaker in event.get("bookmakers", [])[:3]:
+            for market in bookmaker.get("markets", []):
+                if market["key"] != "both_teams_to_score":
+                    continue
+                outcomes = {o["name"]: o["price"] for o in market["outcomes"]}
+                if "Yes" in outcomes and "No" in outcomes:
+                    rows.append({
+                        "event_id":    event["id"],
+                        "home_team":   home,
+                        "away_team":   away,
+                        "odd_btts":    outcomes["Yes"],
+                        "odd_no_btts": outcomes["No"],
+                    })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.groupby(["event_id", "home_team", "away_team"], as_index=False).agg(
+            odd_btts=("odd_btts", "mean"), odd_no_btts=("odd_no_btts", "mean"))
+    logger.info(f"BTTS odds fetched: {len(df)} events ({league_key})")
     return df
 
 
@@ -544,14 +746,26 @@ def init_db():
             edge         REAL, kelly_stake REAL, odd_used REAL,
             outcome      TEXT DEFAULT NULL, pnl REAL DEFAULT NULL,
             home_injuries_out REAL DEFAULT 0, home_injuries_dtd REAL DEFAULT 0,
-            away_injuries_out REAL DEFAULT 0, away_injuries_dtd REAL DEFAULT 0
+            away_injuries_out REAL DEFAULT 0, away_injuries_dtd REAL DEFAULT 0,
+            method       TEXT DEFAULT NULL,
+            odd_closing  REAL DEFAULT NULL
         )
     """)
-    # Migration : ajouter les colonnes blessures si la table existe déjà sans elles
-    for col in ("home_injuries_out", "home_injuries_dtd",
-                "away_injuries_out", "away_injuries_dtd"):
+    # Migration : ajouter les colonnes si la table existe déjà sans elles
+    _migrations = [
+        ("home_injuries_out",    "REAL DEFAULT 0"),
+        ("home_injuries_dtd",    "REAL DEFAULT 0"),
+        ("away_injuries_out",    "REAL DEFAULT 0"),
+        ("away_injuries_dtd",    "REAL DEFAULT 0"),
+        ("method",               "TEXT DEFAULT NULL"),
+        ("odd_closing",          "REAL DEFAULT NULL"),
+        ("odd_opening",          "REAL DEFAULT NULL"),
+        ("opening_movement_pct", "REAL DEFAULT NULL"),
+        ("market",               "TEXT DEFAULT NULL"),
+    ]
+    for col, col_type in _migrations:
         try:
-            c.execute(f"ALTER TABLE predictions ADD COLUMN {col} REAL DEFAULT 0")
+            c.execute(f"ALTER TABLE predictions ADD COLUMN {col} {col_type}")
         except Exception:
             pass  # colonne déjà présente
     c.execute("""
@@ -568,22 +782,69 @@ def init_db():
 
 def save_prediction(pred: dict):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT INTO predictions
-        (sport,league,home_team,away_team,match_date,pred_result,
-         prob_home,prob_draw,prob_away,confidence,is_value_bet,edge,kelly_stake,odd_used,
-         home_injuries_out,home_injuries_dtd,away_injuries_out,away_injuries_dtd)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        pred.get("sport"), pred.get("league"), pred.get("home_team"), pred.get("away_team"),
-        pred.get("match_date"), pred.get("pred_result"), pred.get("prob_home"),
-        pred.get("prob_draw"), pred.get("prob_away"), pred.get("confidence"),
-        int(pred.get("is_value_bet", 0)), pred.get("edge"), pred.get("kelly_stake"), pred.get("odd_used"),
-        pred.get("home_injuries_out", 0), pred.get("home_injuries_dtd", 0),
-        pred.get("away_injuries_out", 0), pred.get("away_injuries_dtd", 0),
-    ))
-    conn.commit()
+    try:
+        conn.execute("""
+            INSERT INTO predictions
+            (sport,league,home_team,away_team,match_date,pred_result,
+             prob_home,prob_draw,prob_away,confidence,is_value_bet,edge,kelly_stake,odd_used,
+             home_injuries_out,home_injuries_dtd,away_injuries_out,away_injuries_dtd,
+             method,odd_opening,market)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pred.get("sport"), pred.get("league"), pred.get("home_team"), pred.get("away_team"),
+            pred.get("match_date"), pred.get("pred_result"), pred.get("prob_home"),
+            pred.get("prob_draw"), pred.get("prob_away"), pred.get("confidence"),
+            int(pred.get("is_value_bet", 0)), pred.get("edge"), pred.get("kelly_stake"), pred.get("odd_used"),
+            pred.get("home_injuries_out", 0), pred.get("home_injuries_dtd", 0),
+            pred.get("away_injuries_out", 0), pred.get("away_injuries_dtd", 0),
+            pred.get("method"),
+            pred.get("odd_used"),   # odd_opening = odd at prediction time
+            pred.get("market"),
+        ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"save_prediction rollback ({pred.get('home_team')} vs {pred.get('away_team')}): {e}")
+        raise
+    finally:
+        conn.close()
+
+
+def get_team_exposure(team_name: str) -> float:
+    """
+    Somme des mises actives (outcome IS NULL) sur la victoire d'une équipe donnée.
+    Compte les paris H où home_team = team et les paris A où away_team = team.
+    Utilisé pour limiter la concentration sur un seul club (MAX_TEAM_EXPOSURE_PCT).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row  = conn.execute("""
+        SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
+        WHERE outcome IS NULL AND kelly_stake > 0
+          AND (
+            (pred_result = 'H' AND home_team = ?) OR
+            (pred_result = 'A' AND away_team = ?)
+          )
+    """, (team_name, team_name)).fetchone()
     conn.close()
+    return float(row[0]) if row else 0.0
+
+
+def count_active_bets_for_league(league: str) -> int:
+    """
+    Nombre de paris 1X2 actifs (outcome IS NULL, kelly_stake > 0) pour une ligue.
+    Utilisé pour la diversification : max MAX_ACTIVE_BETS_PER_LEAGUE par ligue.
+    Les signaux Over/Under ne sont pas comptés (marché indépendant).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row  = conn.execute("""
+        SELECT COUNT(*) FROM predictions
+        WHERE league = ?
+          AND outcome IS NULL
+          AND kelly_stake > 0
+          AND pred_result IN ('H', 'D', 'A')
+    """, (league,)).fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
 
 
 def get_all_predictions() -> pd.DataFrame:

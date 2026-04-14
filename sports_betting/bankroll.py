@@ -209,37 +209,44 @@ class BankrollTracker:
         """
         Enregistre le résultat réel d'un pari.
         outcome : "H", "D" ou "A"
+        Opération atomique : rollback complet si une étape échoue.
         """
         conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT pred_result, kelly_stake, odd_used FROM predictions WHERE id=?",
-                  (prediction_id,))
-        row = c.fetchone()
-        if not row:
+        c    = conn.cursor()
+        try:
+            c.execute("SELECT pred_result, kelly_stake, odd_used FROM predictions WHERE id=?",
+                      (prediction_id,))
+            row = c.fetchone()
+            if not row:
+                return
+
+            pred_result, stake, odd = row
+            won = (pred_result == outcome)
+            pnl = round(stake * (odd - 1), 0) if won else -stake
+
+            c.execute("UPDATE predictions SET outcome=?, pnl=? WHERE id=?",
+                      (outcome, pnl, prediction_id))
+
+            # Mise à jour balance
+            c.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1")
+            balance = c.fetchone()[0]
+            new_balance = balance + pnl
+
+            c.execute("""
+                INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
+                SELECT ?, total_bets+1, wins+?, losses+?, 0
+                FROM bankroll ORDER BY id DESC LIMIT 1
+            """, (new_balance, 1 if won else 0, 0 if won else 1))
+
+            conn.commit()
+            logger.info(f"Bet settled #{prediction_id}: {'WIN' if won else 'LOSS'} | PnL: {pnl:+,.0f} FCFA")
+
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"settle_bet rollback #{prediction_id}: {e}")
+            raise
+        finally:
             conn.close()
-            return
-
-        pred_result, stake, odd = row
-        won = (pred_result == outcome)
-        pnl = round(stake * (odd - 1), 0) if won else -stake
-
-        c.execute("UPDATE predictions SET outcome=?, pnl=? WHERE id=?",
-                  (outcome, pnl, prediction_id))
-
-        # Mise à jour balance
-        c.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1")
-        balance = c.fetchone()[0]
-        new_balance = balance + pnl
-
-        c.execute("""
-            INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
-            SELECT ?, total_bets+1, wins+?, losses+?, 0
-            FROM bankroll ORDER BY id DESC LIMIT 1
-        """, (new_balance, 1 if won else 0, 0 if won else 1))
-
-        conn.commit()
-        conn.close()
-        logger.info(f"Bet settled #{prediction_id}: {'WIN' if won else 'LOSS'} | PnL: {pnl:+,.0f} FCFA")
 
     def _get_settled_bets(self) -> pd.DataFrame:
         conn = sqlite3.connect(DB_PATH)
@@ -248,6 +255,183 @@ class BankrollTracker:
         )
         conn.close()
         return df
+
+    def get_roi_by_confidence(self) -> list:
+        """
+        ROI, win rate et nombre de paris par tranche de confiance du modèle.
+        Tranches : <55%, 55-65%, >65%.
+        Utilisé pour vérifier la calibration du modèle.
+        """
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT
+                CASE
+                    WHEN confidence < 0.55 THEN '<55%'
+                    WHEN confidence < 0.65 THEN '55-65%'
+                    ELSE '>65%'
+                END AS tier,
+                COUNT(*)                                    AS bets,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
+                COALESCE(SUM(pnl), 0)                       AS pnl,
+                COALESCE(SUM(kelly_stake), 0)               AS staked
+            FROM predictions
+            WHERE outcome IS NOT NULL AND kelly_stake > 0
+            GROUP BY tier
+            ORDER BY MIN(confidence)
+        """).fetchall()
+        conn.close()
+
+        result = []
+        for tier, bets, wins, pnl, staked in rows:
+            roi = round(float(pnl) / float(staked) * 100, 2) if staked else 0.0
+            wr  = round(int(wins or 0) / bets * 100, 1)      if bets   else 0.0
+            result.append({
+                "tier":     tier,
+                "bets":     bets,
+                "wins":     int(wins or 0),
+                "win_rate": wr,
+                "pnl":      round(float(pnl), 0),
+                "roi":      roi,
+            })
+        return result
+
+    def get_brier_score(self) -> dict:
+        """
+        Brier Score sur les paris réglés : BS = mean((confidence - won)²).
+        Mesure la calibration du modèle en production (pas seulement à l'entraînement).
+        Références : <0.20 excellent | 0.20-0.25 correct | >0.25 pire que naïf (50/50).
+        """
+        conn = sqlite3.connect(DB_PATH)
+        row  = conn.execute("""
+            SELECT
+                COUNT(*) AS n,
+                AVG(
+                    (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
+                    (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
+                ) AS brier_score
+            FROM predictions
+            WHERE outcome IS NOT NULL
+              AND kelly_stake > 0
+              AND confidence IS NOT NULL
+        """).fetchone()
+        conn.close()
+
+        n, score = row
+        if not n or score is None:
+            return {}
+        return {"score": round(float(score), 4), "n": int(n)}
+
+    def get_avg_clv(self) -> dict:
+        """
+        Closing Line Value moyen sur les paris réglés où odd_closing est disponible.
+        CLV = (odd_used / odd_closing - 1) × 100
+        CLV > 0 = on a obtenu une meilleure cote que la fermeture → edge réel confirmé.
+        CLV < 0 = le marché avait raison contre nous → à surveiller.
+        """
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT odd_used, odd_closing
+            FROM predictions
+            WHERE outcome IS NOT NULL
+              AND kelly_stake > 0
+              AND odd_used    > 0
+              AND odd_closing IS NOT NULL
+              AND odd_closing > 0
+        """).fetchall()
+        conn.close()
+
+        if not rows:
+            return {}
+
+        clvs = [(float(r[0]) / float(r[1]) - 1) * 100 for r in rows]
+        return {
+            "avg_clv":   round(sum(clvs) / len(clvs), 2),
+            "beat_rate": round(sum(1 for c in clvs if c > 0) / len(clvs) * 100, 1),
+            "n_bets":    len(clvs),
+        }
+
+    def get_recent_settled_pnl(self, days: int = 2) -> float:
+        """
+        P&L total des paris réglés sur les N derniers jours de matchs.
+        Utilisé par le stop-loss journalier.
+        """
+        conn = sqlite3.connect(DB_PATH)
+        row  = conn.execute("""
+            SELECT COALESCE(SUM(pnl), 0) FROM predictions
+            WHERE outcome IS NOT NULL
+              AND DATE(match_date) >= date('now', ?)
+        """, (f"-{days} days",)).fetchone()
+        conn.close()
+        return float(row[0]) if row else 0.0
+
+    def get_weekly_stats(self) -> dict:
+        """Stats des paris réglés sur les 7 derniers jours."""
+        conn = sqlite3.connect(DB_PATH)
+        df   = pd.read_sql_query("""
+            SELECT * FROM predictions
+            WHERE outcome IS NOT NULL
+              AND DATE(match_date) >= date('now', '-7 days')
+            ORDER BY match_date ASC
+        """, conn)
+        conn.close()
+
+        if df.empty:
+            return {}
+
+        total_staked = df["kelly_stake"].sum()
+        total_pnl    = df["pnl"].sum()
+        wins         = int((df["pnl"] > 0).sum())
+        losses       = int((df["pnl"] < 0).sum())
+        n            = len(df)
+
+        roi_week = round(total_pnl / total_staked * 100, 2) if total_staked > 0 else 0.0
+
+        # Ligue la plus rentable
+        best_league     = None
+        best_league_pnl = 0.0
+        if "league" in df.columns:
+            by_league = df.groupby("league")["pnl"].sum()
+            if not by_league.empty:
+                best_league     = by_league.idxmax()
+                best_league_pnl = round(float(by_league.max()), 0)
+
+        # Meilleure prédiction (plus grosse mise gagnée)
+        best_bet = None
+        winners  = df[df["pnl"] > 0]
+        if not winners.empty:
+            best_row = winners.loc[winners["pnl"].idxmax()]
+            best_bet = {
+                "match": f"{best_row.get('home_team', '?')} vs {best_row.get('away_team', '?')}",
+                "pnl":   round(float(best_row["pnl"]), 0),
+                "odd":   round(float(best_row.get("odd_used") or 0), 2),
+            }
+
+        # Série en cours (W/L)
+        streak_type = None
+        streak_val  = 0
+        for _, row in df.sort_values("match_date", ascending=False).iterrows():
+            won = float(row["pnl"]) > 0
+            if streak_type is None:
+                streak_type = "W" if won else "L"
+                streak_val  = 1
+            elif (streak_type == "W" and won) or (streak_type == "L" and not won):
+                streak_val += 1
+            else:
+                break
+
+        return {
+            "bets":            n,
+            "wins":            wins,
+            "losses":          losses,
+            "win_rate":        round(wins / n * 100, 1) if n > 0 else 0.0,
+            "pnl":             round(float(total_pnl), 0),
+            "roi":             roi_week,
+            "best_league":     best_league,
+            "best_league_pnl": best_league_pnl,
+            "best_bet":        best_bet,
+            "streak_type":     streak_type,
+            "streak_val":      streak_val,
+        }
 
     def performance_summary(self) -> pd.DataFrame:
         """Résumé de performance par sport/ligue."""

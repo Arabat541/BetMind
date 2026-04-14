@@ -15,7 +15,7 @@ load_dotenv()
 from config import FOOTBALL_DATA_KEY, FOOTBALL_DATA_BASE, DB_PATH, BALLDONTLIE_KEY
 from data_fetcher import _http_get_with_retry
 from bankroll import BankrollTracker
-from telegram_bot import send_message
+from telegram_bot import send_message, send_model_drift_alert
 
 logger  = logging.getLogger(__name__)
 tracker = BankrollTracker()
@@ -297,6 +297,36 @@ def _send_result_alert(pred, outcome: str, won: bool, pnl: float):
 
 
 # ════════════════════════════════════════════════════════════
+# DÉTECTION DE DÉRIVE
+# ════════════════════════════════════════════════════════════
+
+def _check_model_drift(n: int = 20):
+    """
+    Si le win rate des N derniers paris réglés (avec mise > 0) est < 30%,
+    envoie une alerte Telegram de dérive du modèle.
+    Appelé après chaque batch de résultats réglés.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT pnl FROM predictions
+        WHERE outcome IS NOT NULL AND kelly_stake > 0
+        ORDER BY match_date DESC
+        LIMIT ?
+    """, (n,)).fetchall()
+    conn.close()
+
+    if len(rows) < n:
+        return  # pas encore assez d'historique
+
+    wins     = sum(1 for (pnl,) in rows if pnl > 0)
+    win_rate = wins / len(rows) * 100
+
+    if win_rate < 30.0:
+        logger.warning(f"Dérive détectée : win rate = {win_rate:.1f}% sur {n} paris")
+        send_model_drift_alert(win_rate, n)
+
+
+# ════════════════════════════════════════════════════════════
 # PIPELINE PRINCIPAL
 # ════════════════════════════════════════════════════════════
 
@@ -380,6 +410,7 @@ def run_result_checker():
             f"{wins}W / {losses}L | "
             f"Bankroll: {balance:,.0f} FCFA"
         )
+        _check_model_drift()
         if settled >= 3:
             from telegram_bot import send_daily_summary
             send_daily_summary(tracker.get_stats())

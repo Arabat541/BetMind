@@ -1,13 +1,48 @@
 
-## Améliorations qualitatives — classées par priorité
+## Amélioration des performances prédictives — classées par priorité
 
 
-### E — Rapport hebdomadaire enrichi (BASSE)
-`send_weekly_summary` actuel : uniquement stats globales.
-Ajouter : ROI de la semaine écoulée (vs cumul), ligue la plus rentable de la semaine,
-meilleure prédiction (plus grosse mise gagnée), série en cours (streak W/L).
+### ✅ A — Shots (HST/HS proxy xG) comme features — FAIT
+### ✅ B — Walk-forward validation (TimeSeriesSplit n=5) — FAIT
+### ✅ D — Hyperparameter tuning avec Optuna (40 trials) — FAIT
+  Meilleurs params football : n_estimators=130, max_depth=3, lr=0.025
+  Accuracy : 53.7% ± 0.9% (vs 52.4% avant shots) — sauvegardé best_params_football.json
+### ✅ C — Ensemble XGB + LGB + stacking (LR méta-modèle) — FAIT
+  Ensemble OOF accuracy : 53.8% ± 0.9% — sauvegardé football_ensemble_model.pkl
+  predictor.py charge l'ensemble en priorité via model.py
+### ✅ E — Fatigue / densité de calendrier — FAIT
+### ✅ G — Feature "motivation" / enjeu du match — FAIT
 
-### F — Alerte dérive du modèle (BASSE)
-Si win rate sur les 20 derniers paris réglés < 30%, envoyer une alerte Telegram :
-possible dérive du modèle (données ou marché ont changé).
-Calculer dans result_checker après chaque batch de résultats.
+
+### ✅ F — Marché BTTS (Both Teams To Score) — FAIT
+  train_btts.py : 6775 matchs, Accuracy 53.0% ± 3.0%
+  Modèle sauvegardé : btts_football_xgb_model.pkl
+  Signal BTTS intégré dans run_football_predictions() (edge min 7%)
+  fetch_football_btts_odds() ajouté dans data_fetcher.py
+  build_btts_signal() + detect_btts_value_bet() dans model.py
+
+### ✅ H — Signal cote d'ouverture vs cote actuelle — FAIT
+  odd_opening sauvegardé en DB au moment de la prédiction (= odd_used initial)
+  opening_movement_pct calculé et stocké à chaque check_odds_movement()
+  Mouvement < -5% → mise annulée (marché contre nous)
+  Mouvement > +5% → log "Sharp money ✓" (sharps confirment notre pari)
+  Colonnes DB ajoutées : odd_opening, opening_movement_pct, market
+
+
+### ✅ I — SHAP values feature importance — FAIT
+  compute_shap() dans train_from_csv.py : TreeExplainer sur XGBClassifier brut
+  Top 10 features loguées + graphique sauvegardé : models/shap_football.png
+  Échantillon 2000 matchs, headless matplotlib (Agg backend)
+
+### ✅ J — Données météo — FAIT
+  fetch_match_weather(home_team) dans data_fetcher.py (OpenWeatherMap forecast)
+  OPENWEATHER_KEY dans .env (plan gratuit, 60 req/min)
+  feature binaire rainy_match : pluie > 2mm/h OU vent > 30 km/h → 1
+  60 stades GPS dans STADIUM_COORDS (config.py) — 5 ligues couvertes
+  feature rainy_match ajoutée dans build_football_features() + get_feature_columns()
+
+### ✅ K — Asian Handicap -0.5 — FAIT
+  detect_ah_value_bet() dans model.py : P(AH) = P(home)/(P(home)+P(away))
+  fetch_football_ah_odds() dans data_fetcher.py (marché asian_handicap)
+  Signal AH inséré dans run_football_predictions() (edge min 6%)
+  Pas de modèle séparé — dérivé des probas du modèle football existant

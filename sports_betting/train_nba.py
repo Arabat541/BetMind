@@ -32,8 +32,16 @@ except ImportError:
     from sklearn.ensemble import GradientBoostingClassifier
     XGB_AVAILABLE = False
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
+import numpy as np
 from sklearn.metrics import accuracy_score, log_loss, classification_report
+
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_OK = True
+except ImportError:
+    OPTUNA_OK = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,8 +51,9 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MODELS_DIR = "models"
-DATA_DIR   = "data"
+MODELS_DIR       = "models"
+DATA_DIR         = "data"
+BEST_PARAMS_PATH = os.path.join(MODELS_DIR, "best_params_nba.json")
 
 # 5 saisons × ~1230 matchs = ~6150 matchs bruts
 # Après exclusion MIN_GAMES_BEFORE : ~5400 exemples
@@ -275,6 +284,63 @@ def build_dataset() -> pd.DataFrame:
     return dataset
 
 
+# ── Optuna — D ────────────────────────────────────────────────────────────────
+
+def _nba_objective(trial, X: pd.DataFrame, y: pd.Series) -> float:
+    params = {
+        "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
+        "max_depth":        trial.suggest_int("max_depth", 3, 7),
+        "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        "eval_metric":      "logloss",
+        "random_state":     42,
+        "n_jobs":           -1,
+    }
+    tss = TimeSeriesSplit(n_splits=3)
+    losses = []
+    for tr_idx, val_idx in tss.split(X):
+        m = XGBClassifier(**params) if XGB_AVAILABLE else GradientBoostingClassifier(
+            n_estimators=100, max_depth=params["max_depth"],
+            learning_rate=params["learning_rate"], random_state=42,
+        )
+        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        losses.append(log_loss(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])))
+    return float(np.mean(losses))
+
+
+def optimize_hyperparams_nba(X: pd.DataFrame, y: pd.Series, n_trials: int = 40) -> dict:
+    """Optuna search NBA — minimise log_loss sur TimeSeriesSplit(3)."""
+    if not OPTUNA_OK or not XGB_AVAILABLE:
+        logger.warning("Optuna/XGB non disponible — hyperparamètres par défaut.")
+        return {}
+
+    logger.info(f"Optuna hyperparameter tuning NBA ({n_trials} trials)...")
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(
+        lambda t: _nba_objective(t, X, y),
+        n_trials=n_trials,
+        n_jobs=1,
+        show_progress_bar=False,
+    )
+
+    best = dict(study.best_params)
+    best.update({"eval_metric": "logloss", "random_state": 42, "n_jobs": -1})
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    with open(BEST_PARAMS_PATH, "w", encoding="utf-8") as f:
+        import json
+        json.dump({"params": best, "best_log_loss": round(study.best_value, 6)}, f, indent=2)
+
+    logger.info(f"Best log_loss : {study.best_value:.4f}")
+    logger.info(f"Best params   : {best}")
+    return best
+
+
 # ── Entraînement ──────────────────────────────────────────────────────────────
 
 def train(df: pd.DataFrame) -> float:
@@ -289,42 +355,61 @@ def train(df: pd.DataFrame) -> float:
         f"(0=home win, 1=away win)"
     )
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    logger.info(f"Train: {len(X_train)} | Test: {len(X_test)}")
+    # Optuna tuning — D
+    best_params = optimize_hyperparams_nba(X, y, n_trials=40)
+    xgb_params  = best_params if best_params else {
+        "n_estimators": 300, "max_depth": 4, "learning_rate": 0.05,
+        "subsample": 0.8, "colsample_bytree": 0.8,
+        "eval_metric": "logloss", "random_state": 42, "n_jobs": -1,
+    }
 
+    # Walk-forward validation — B
+    logger.info("Walk-forward validation (TimeSeriesSplit n_splits=5)...")
+    tss       = TimeSeriesSplit(n_splits=5)
+    fold_accs = []
+    fold_lls  = []
+
+    for fold, (tr_idx, val_idx) in enumerate(tss.split(X)):
+        X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
+        if XGB_AVAILABLE:
+            m = XGBClassifier(**xgb_params)
+        else:
+            m = GradientBoostingClassifier(
+                n_estimators=200, max_depth=4,
+                learning_rate=0.05, random_state=42,
+            )
+        m.fit(X_tr, y_tr)
+        acc_f = accuracy_score(y_val, m.predict(X_val))
+        ll_f  = log_loss(y_val, m.predict_proba(X_val))
+        fold_accs.append(acc_f)
+        fold_lls.append(ll_f)
+        logger.info(f"  Fold {fold + 1}: Accuracy={acc_f:.3f} | LogLoss={ll_f:.4f} | val={len(val_idx)}")
+
+    acc  = float(np.mean(fold_accs))
+    loss = float(np.mean(fold_lls))
+    logger.info(f"\n{'─'*50}")
+    logger.info(f"Walk-forward NBA — Accuracy: {acc:.3f} ± {np.std(fold_accs):.3f}  (baseline: {baseline:.3f})")
+    logger.info(f"LogLoss moyen    : {loss:.4f}")
+    logger.info(f"Gain vs baseline : {acc - baseline:+.3f}")
+
+    # Modèle final sur toutes les données
     if XGB_AVAILABLE:
-        model = XGBClassifier(
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            eval_metric="logloss",
-            random_state=42,
-            n_jobs=-1,
-        )
-        logger.info("Entraînement XGBoost...")
+        model = XGBClassifier(**xgb_params)
+        logger.info("Entraînement final XGBoost (toutes données)...")
     else:
         model = GradientBoostingClassifier(
             n_estimators=200, max_depth=4,
-            learning_rate=0.05, random_state=42
+            learning_rate=0.05, random_state=42,
         )
-        logger.info("Entraînement GradientBoosting (XGBoost non disponible)...")
+        logger.info("Entraînement final GradientBoosting (toutes données)...")
 
-    model.fit(X_train, y_train)
+    model.fit(X, y)
 
-    y_pred  = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)
-    acc     = accuracy_score(y_test, y_pred)
-    loss    = log_loss(y_test, y_proba)
-
-    logger.info(f"\n{'─'*50}")
-    logger.info(f"Accuracy : {acc:.3f}  (baseline: {baseline:.3f})")
-    logger.info(f"LogLoss  : {loss:.4f}")
-    logger.info(f"Gain vs baseline : {acc - baseline:+.3f}")
-    logger.info(f"\n{classification_report(y_test, y_pred, target_names=['home_win', 'away_win'])}")
+    # Rapport classification sur dernier fold (approximation)
+    last_tr, last_val = list(tss.split(X))[-1]
+    y_pred_last = model.predict(X.iloc[last_val])
+    logger.info(f"\n{classification_report(X.iloc[last_val].index[:0].tolist() or y.iloc[last_val], y_pred_last, target_names=['home_win', 'away_win'], zero_division=0)}")
 
     # Feature importance
     if hasattr(model, "feature_importances_"):

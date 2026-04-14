@@ -4,23 +4,25 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
 import schedule
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from config import FOOTBALL_LEAGUES, CONFIDENCE_THRESHOLD, LOW_BANKROLL_THRESHOLD, ALERT_MIN_EDGE, FD_DAILY_LIMIT, MAX_DAILY_STAKE_PCT
+from config import FOOTBALL_LEAGUES, CONFIDENCE_THRESHOLD, LOW_BANKROLL_THRESHOLD, ALERT_MIN_EDGE, FD_DAILY_LIMIT, MAX_DAILY_STAKE_PCT, DAILY_STOP_LOSS_PCT, ODDS_MOVEMENT_THRESHOLD, MAX_ACTIVE_BETS_PER_LEAGUE, MAX_TEAM_EXPOSURE_PCT
 from data_fetcher import (
     init_db, fetch_upcoming_football_fixtures,
     fetch_upcoming_nba_games, fetch_football_odds, fetch_football_ou_odds,
+    fetch_football_btts_odds, fetch_football_ah_odds,
     fetch_nba_odds, fetch_nba_injuries, save_prediction, is_already_predicted,
-    get_fd_quota_used,
+    get_fd_quota_used, count_active_bets_for_league, get_team_exposure,
 )
 from feature_engineering import build_football_features, build_nba_features
-from model import BettingModel, build_prediction_signal, build_ou_signal
+from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet
 from bankroll import BankrollTracker, recommended_stake
-from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message
+from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 football_model = BettingModel(sport="football")
 ou_model       = BettingModel(sport="ou_football")
+btts_model     = BettingModel(sport="btts_football")
 nba_model      = BettingModel(sport="nba")
 tracker        = BankrollTracker()
 
@@ -68,8 +71,10 @@ def run_football_predictions():
         "Bundesliga":       "soccer_germany_bundesliga",
         "Champions League": "soccer_uefa_champs_league",
     }
-    league_odds_map    = {lg: fetch_football_odds(key)    for lg, key in _LEAGUE_KEYS.items()}
-    league_ou_odds_map = {lg: fetch_football_ou_odds(key) for lg, key in _LEAGUE_KEYS.items()}
+    league_odds_map      = {lg: fetch_football_odds(key)      for lg, key in _LEAGUE_KEYS.items()}
+    league_ou_odds_map   = {lg: fetch_football_ou_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
+    league_btts_odds_map = {lg: fetch_football_btts_odds(key) for lg, key in _LEAGUE_KEYS.items()}
+    league_ah_odds_map   = {lg: fetch_football_ah_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
 
     signals       = []
     bankroll      = tracker.get_balance()
@@ -80,6 +85,14 @@ def run_football_predictions():
         try:
             if is_already_predicted(fix["home_team"], fix["away_team"], fix["date"]):
                 logger.info(f"Skip (déjà prédit): {fix['home_team']} vs {fix['away_team']}")
+                continue
+
+            active = count_active_bets_for_league(fix["league"])
+            if active >= MAX_ACTIVE_BETS_PER_LEAGUE:
+                logger.info(
+                    f"Diversification: {fix['league']} déjà {active} paris actifs "
+                    f"(max {MAX_ACTIVE_BETS_PER_LEAGUE}). Skip {fix['home_team']} vs {fix['away_team']}."
+                )
                 continue
 
             remaining = daily_limit - daily_staked
@@ -93,6 +106,7 @@ def run_football_predictions():
                 league_code=fix["league_code"],
                 home_name=fix["home_team"],
                 away_name=fix["away_team"],
+                league_name=fix["league"],
             )
             if features is None:
                 continue
@@ -124,14 +138,68 @@ def run_football_predictions():
             signal["kelly_stake"]    = stake_info["stake_amount"]
             signal["stake_pct"]      = stake_info["stake_pct"]
             signal["expected_value"] = stake_info.get("expected_value", 0)
-            daily_staked += stake_info["stake_amount"]
 
+            # ── Exposition nette par équipe ───────────────────
+            if signal["pred_result"] in ("H", "A"):
+                w_team   = fix["home_team"] if signal["pred_result"] == "H" else fix["away_team"]
+                team_exp = get_team_exposure(w_team)
+                if team_exp + signal["kelly_stake"] > bankroll * MAX_TEAM_EXPOSURE_PCT:
+                    logger.info(
+                        f"Exposition {w_team}: {team_exp:,.0f}+{signal['kelly_stake']:,.0f} FCFA"
+                        f" > {bankroll * MAX_TEAM_EXPOSURE_PCT:,.0f} FCFA"
+                        f" (max {MAX_TEAM_EXPOSURE_PCT:.0%}). Skip."
+                    )
+                    continue
+
+            daily_staked += stake_info["stake_amount"]
             signals.append(signal)
             _log_signal(signal, stake_info)
             save_prediction({**signal, "sport": "football"})
 
             if _should_alert(signal):
                 send_prediction_alert(signal, stake_info)
+
+            # ── Signal Asian Handicap -0.5 — K ───────────────
+            if football_model.is_trained and daily_staked < daily_limit and signal:
+                ah_odds_df  = league_ah_odds_map.get(fix["league"])
+                ah_odds_row = _match_ou_odds(ah_odds_df, fix["home_team"], fix["away_team"]) \
+                              if ah_odds_df is not None else {}
+                ah_vb = detect_ah_value_bet(
+                    prob_home=signal.get("prob_home", 0),
+                    prob_away=signal.get("prob_away", 0),
+                    prob_draw=signal.get("prob_draw", 0),
+                    ah_odds_row=ah_odds_row,
+                )
+                if ah_vb:
+                    remaining  = daily_limit - daily_staked
+                    ah_sig     = {
+                        **{k: signal[k] for k in ("sport", "league", "home_team", "away_team", "match_date")},
+                        "pred_result":  ah_vb["result"],
+                        "pred_name":    ah_vb["result_name"],
+                        "prob_home":    signal.get("prob_home", 0),
+                        "prob_draw":    0.0,
+                        "prob_away":    signal.get("prob_away", 0),
+                        "confidence":   ah_vb["p_model"],
+                        "method":       "asian_handicap",
+                        "value_bets":   [ah_vb],
+                        "is_value_bet": True,
+                        "edge":         ah_vb["edge"],
+                        "odd_used":     ah_vb["odd"],
+                        "market":       "AH-0.5",
+                    }
+                    ah_stake = recommended_stake(ah_sig, bankroll)
+                    if ah_stake["stake_amount"] > remaining:
+                        ah_stake["stake_amount"] = round(remaining)
+                        ah_stake["stake_pct"] = round(remaining / bankroll, 4) if bankroll > 0 else 0
+                    ah_sig["kelly_stake"]    = ah_stake["stake_amount"]
+                    ah_sig["stake_pct"]      = ah_stake["stake_pct"]
+                    ah_sig["expected_value"] = ah_stake.get("expected_value", 0)
+                    daily_staked += ah_stake["stake_amount"]
+                    signals.append(ah_sig)
+                    _log_signal(ah_sig, ah_stake)
+                    save_prediction(ah_sig)
+                    if _should_alert(ah_sig):
+                        send_prediction_alert(ah_sig, ah_stake)
 
             # ── Signal Over/Under (marché indépendant) ────────
             if ou_model.is_trained and daily_staked < daily_limit:
@@ -158,6 +226,33 @@ def run_football_predictions():
                     save_prediction(ou_sig)
                     if _should_alert(ou_sig):
                         send_prediction_alert(ou_sig, ou_stake)
+
+            # ── Signal BTTS (marché indépendant) — F ──────────
+            if btts_model.is_trained and daily_staked < daily_limit:
+                btts_odds_df  = league_btts_odds_map.get(fix["league"])
+                btts_odds_row = _match_ou_odds(btts_odds_df, fix["home_team"], fix["away_team"]) \
+                                if btts_odds_df is not None else {}
+                btts_sig = build_btts_signal(features, btts_odds_row, btts_model, {
+                    "league":    fix["league"],
+                    "home_team": fix["home_team"],
+                    "away_team": fix["away_team"],
+                    "date":      fix["date"],
+                })
+                if btts_sig:
+                    remaining = daily_limit - daily_staked
+                    btts_stake = recommended_stake(btts_sig, bankroll)
+                    if btts_stake["stake_amount"] > remaining:
+                        btts_stake["stake_amount"] = round(remaining)
+                        btts_stake["stake_pct"] = round(remaining / bankroll, 4) if bankroll > 0 else 0
+                    btts_sig["kelly_stake"]    = btts_stake["stake_amount"]
+                    btts_sig["stake_pct"]      = btts_stake["stake_pct"]
+                    btts_sig["expected_value"] = btts_stake.get("expected_value", 0)
+                    daily_staked += btts_stake["stake_amount"]
+                    signals.append(btts_sig)
+                    _log_signal(btts_sig, btts_stake)
+                    save_prediction(btts_sig)
+                    if _should_alert(btts_sig):
+                        send_prediction_alert(btts_sig, btts_stake)
 
             time.sleep(0.2)
 
@@ -199,6 +294,14 @@ def run_nba_predictions():
         try:
             if is_already_predicted(game["home_team"], game["away_team"], game["date"]):
                 logger.info(f"Skip (déjà prédit): {game['home_team']} vs {game['away_team']}")
+                continue
+
+            active_nba = count_active_bets_for_league("NBA")
+            if active_nba >= MAX_ACTIVE_BETS_PER_LEAGUE:
+                logger.info(
+                    f"Diversification: NBA déjà {active_nba} paris actifs "
+                    f"(max {MAX_ACTIVE_BETS_PER_LEAGUE}). Skip {game['home_team']} vs {game['away_team']}."
+                )
                 continue
 
             home_id = NBA_TEAM_IDS.get(game["home_abbr"])
@@ -248,6 +351,18 @@ def run_nba_predictions():
             signal["kelly_stake"]    = stake_info["stake_amount"]
             signal["stake_pct"]      = stake_info["stake_pct"]
             signal["expected_value"] = stake_info.get("expected_value", 0)
+
+            # ── Exposition nette par équipe ───────────────────
+            if signal["pred_result"] in ("H", "A"):
+                w_team   = game["home_team"] if signal["pred_result"] == "H" else game["away_team"]
+                team_exp = get_team_exposure(w_team)
+                if team_exp + signal["kelly_stake"] > bankroll * MAX_TEAM_EXPOSURE_PCT:
+                    logger.info(
+                        f"Exposition {w_team}: {team_exp:,.0f}+{signal['kelly_stake']:,.0f} FCFA"
+                        f" > {bankroll * MAX_TEAM_EXPOSURE_PCT:,.0f} FCFA. Skip."
+                    )
+                    continue
+
             daily_staked += stake_info["stake_amount"]
 
             # Propager les données de blessures dans le signal (affichage Telegram)
@@ -344,6 +459,147 @@ def _log_signal(signal: dict, stake_info: dict):
     )
 
 
+_LEAGUE_KEYS_OM = {
+    "Ligue 1":          "soccer_france_ligue_one",
+    "Premier League":   "soccer_epl",
+    "La Liga":          "soccer_spain_la_liga",
+    "Serie A":          "soccer_italy_serie_a",
+    "Bundesliga":       "soccer_germany_bundesliga",
+    "Champions League": "soccer_uefa_champs_league",
+}
+
+
+def check_odds_movement():
+    """
+    Pour les paris en attente générés dans les dernières 24h,
+    vérifie si la cote a baissé de > ODDS_MOVEMENT_THRESHOLD depuis la prédiction.
+    Si oui : annule la mise (kelly_stake = 0) + alerte Telegram.
+    Signal de "sharp money" : le marché s'est retourné contre notre prédiction.
+    """
+    import sqlite3
+    from config import DB_PATH
+
+    conn  = sqlite3.connect(DB_PATH)
+    rows  = conn.execute("""
+        SELECT id, sport, league, home_team, away_team, pred_result, odd_used, kelly_stake
+        FROM predictions
+        WHERE outcome IS NULL
+          AND kelly_stake > 0
+          AND datetime(created_at) >= datetime('now', '-24 hours')
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    cols   = ("id", "sport", "league", "home_team", "away_team",
+              "pred_result", "odd_used", "kelly_stake")
+    recent = [dict(zip(cols, r)) for r in rows]
+    logger.info(f"Odds movement check : {len(recent)} paris en attente à vérifier")
+
+    # Cache pour éviter de re-fetcher la même ligue plusieurs fois
+    cache_1x2: dict = {}
+    cache_ou:  dict = {}
+
+    for pred in recent:
+        sport    = pred["sport"]
+        league   = pred["league"]
+        pred_r   = pred["pred_result"]
+        saved    = float(pred["odd_used"] or 0)
+
+        if saved <= 0:
+            continue
+
+        is_ou = pred_r in ("O", "U")
+
+        try:
+            if sport == "football":
+                lg_key = _LEAGUE_KEYS_OM.get(league)
+                if not lg_key:
+                    continue
+                if is_ou:
+                    if lg_key not in cache_ou:
+                        cache_ou[lg_key] = fetch_football_ou_odds(lg_key)
+                    odds_row   = _match_ou_odds(cache_ou[lg_key], pred["home_team"], pred["away_team"])
+                    current    = odds_row.get("odd_over") if pred_r == "O" else odds_row.get("odd_under")
+                else:
+                    if lg_key not in cache_1x2:
+                        cache_1x2[lg_key] = fetch_football_odds(lg_key)
+                    odds_row   = _match_odds(cache_1x2[lg_key], pred["home_team"], pred["away_team"])
+                    current    = (
+                        odds_row.get("odd_home") if pred_r == "H"
+                        else odds_row.get("odd_draw") if pred_r == "D"
+                        else odds_row.get("odd_away")
+                    )
+            elif sport == "nba":
+                if "nba" not in cache_1x2:
+                    cache_1x2["nba"] = fetch_nba_odds()
+                odds_row = _match_odds(cache_1x2["nba"], pred["home_team"], pred["away_team"])
+                current  = odds_row.get("odd_home") if pred_r == "H" else odds_row.get("odd_away")
+            else:
+                continue
+
+            if not current:
+                continue
+
+            current_f = float(current)
+            # movement_pct > 0 = odd dropped (market moved toward our pick = sharps confirm)
+            # movement_pct < 0 = odd rose (market moved against our pick = bad sign)
+            movement_pct = round((saved - current_f) / saved, 4)
+            drop_pct     = -movement_pct if movement_pct < 0 else movement_pct
+
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                if movement_pct < -ODDS_MOVEMENT_THRESHOLD:
+                    # Cote montée > seuil : marché retourné contre nous → annuler
+                    conn.execute(
+                        "UPDATE predictions SET odd_closing=?, kelly_stake=0, opening_movement_pct=? WHERE id=?",
+                        (current_f, movement_pct, int(pred["id"]))
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE predictions SET odd_closing=?, opening_movement_pct=? WHERE id=?",
+                        (current_f, movement_pct, int(pred["id"]))
+                    )
+                conn.commit()
+            except Exception as db_err:
+                conn.rollback()
+                logger.error(f"check_odds_movement DB error: {db_err}")
+            finally:
+                conn.close()
+
+            if movement_pct < -ODDS_MOVEMENT_THRESHOLD:
+                # Marché contre nous : annuler
+                logger.warning(
+                    f"Cote bougée CONTRE — {pred['home_team']} vs {pred['away_team']} "
+                    f"({pred_r}): {saved:.2f} → {current_f:.2f} ({movement_pct:+.1%}). Mise annulée."
+                )
+                send_odds_movement_alert(
+                    home_team=pred["home_team"], away_team=pred["away_team"],
+                    league=league, pred_result=pred_r,
+                    odd_saved=saved, odd_current=current_f, drop_pct=abs(movement_pct),
+                )
+            elif movement_pct > 0.05:
+                # Sharps confirment notre pari (cote a baissé > 5%)
+                logger.info(
+                    f"Sharp money ✓ — {pred['home_team']} vs {pred['away_team']} "
+                    f"({pred_r}): {saved:.2f} → {current_f:.2f} ({movement_pct:+.1%})"
+                )
+        except Exception as e:
+            logger.error(f"Odds movement check error ({pred['home_team']} vs {pred['away_team']}): {e}")
+
+
+def _check_daily_stop_loss(bankroll: float) -> tuple[bool, float]:
+    """
+    Vérifie si le stop-loss journalier doit bloquer les nouvelles mises.
+    Retourne (déclenché, pnl_récent).
+    Basé sur le P&L des paris réglés sur les 2 derniers jours de matchs.
+    """
+    recent_pnl = tracker.get_recent_settled_pnl(days=2)
+    threshold  = -(bankroll * DAILY_STOP_LOSS_PCT)
+    return recent_pnl < threshold, recent_pnl
+
+
 def run_all():
     logger.info(f"\n{'═'*60}")
     logger.info(f"  SPORTS BETTING AGENT — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -356,6 +612,19 @@ def run_all():
         logger.warning(f"Bankroll critique: {bankroll:,.0f} FCFA < {LOW_BANKROLL_THRESHOLD:,.0f} FCFA")
         send_bankroll_alert(bankroll, LOW_BANKROLL_THRESHOLD)
 
+    # Stop-loss journalier : P&L récent < -5% bankroll → aucune nouvelle mise
+    stop_triggered, recent_pnl = _check_daily_stop_loss(bankroll)
+    if stop_triggered:
+        logger.warning(
+            f"Stop-loss journalier déclenché : P&L récent = {recent_pnl:+,.0f} FCFA "
+            f"(seuil = -{DAILY_STOP_LOSS_PCT:.0%} × {bankroll:,.0f} FCFA)"
+        )
+        send_stop_loss_alert(recent_pnl, bankroll, DAILY_STOP_LOSS_PCT)
+        return []
+
+    # Vérification des mouvements de cotes (annule les mises sur cotes bougées)
+    check_odds_movement()
+
     football_signals = run_football_predictions()
     nba_signals      = run_nba_predictions()
 
@@ -367,8 +636,12 @@ def run_all():
 
 def send_weekly_report():
     """Envoie le résumé hebdomadaire des performances via Telegram."""
-    stats = tracker.get_stats()
-    send_weekly_summary(stats)
+    stats        = tracker.get_stats()
+    weekly_stats = tracker.get_weekly_stats()
+    conf_stats   = tracker.get_roi_by_confidence()
+    clv_stats    = tracker.get_avg_clv()
+    brier_stats  = tracker.get_brier_score()
+    send_weekly_summary(stats, weekly_stats, conf_stats, clv_stats, brier_stats)
     logger.info("Résumé hebdomadaire envoyé.")
 
 
@@ -422,9 +695,10 @@ def retrain_models():
             results_log.append((script, False, None, str(e)))
 
     # Recharger les modèles en mémoire
-    global football_model, ou_model, nba_model
+    global football_model, ou_model, btts_model, nba_model
     football_model = BettingModel(sport="football")
     ou_model       = BettingModel(sport="ou_football")
+    btts_model     = BettingModel(sport="btts_football")
     nba_model      = BettingModel(sport="nba")
     logger.info("Modèles rechargés en mémoire après retraining.")
 
@@ -506,6 +780,40 @@ def send_daily_report():
     logger.info("Résumé quotidien envoyé.")
 
 
+def backup_database():
+    """
+    Backup quotidien de la DB SQLite dans data/backups/.
+    Rotation automatique : 7 jours conservés, les anciens sont purgés.
+    Alerte Telegram si le backup échoue.
+    """
+    from config import DB_PATH, DATA_DIR
+    backup_dir = os.path.join(DATA_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    today       = datetime.now().strftime("%Y-%m-%d")
+    backup_path = os.path.join(backup_dir, f"betting_{today}.db")
+    try:
+        shutil.copy2(DB_PATH, backup_path)
+        logger.info(f"DB backup OK → {backup_path}")
+
+        # Purge des backups de plus de 7 jours
+        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        for fname in os.listdir(backup_dir):
+            if fname.startswith("betting_") and fname.endswith(".db"):
+                date_part = fname[8:18]  # betting_YYYY-MM-DD.db
+                if date_part < cutoff:
+                    os.remove(os.path.join(backup_dir, fname))
+                    logger.info(f"Backup purgé : {fname}")
+    except Exception as e:
+        logger.error(f"DB backup échoué : {e}")
+        send_message(
+            f"🚨 <b>BACKUP DB ÉCHOUÉ</b>\n\n"
+            f"Erreur : <code>{e}</code>\n\n"
+            "Vérifier l'espace disque et les permissions.\n\n"
+            "🤖 BetMind Agent"
+        )
+
+
 def check_silence():
     """Alerte Telegram si aucune prédiction n'a été faite depuis 24h."""
     import sqlite3
@@ -534,12 +842,86 @@ def check_silence():
         logger.error(f"check_silence error: {e}")
 
 
+def run_health_check():
+    """
+    Healthcheck complet exécuté chaque matin à 07h30 (avant le cycle 08h00).
+    Vérifie :
+      1. Modèles chargeables (football + NBA + OU)
+      2. DB accessible + cohérente (aucune prédiction avec kelly_stake IS NULL)
+      3. Quota football-data.org restant (alerte si < 20 requêtes)
+      4. Espace disque libre (alerte si < 500 Mo)
+    Envoie un rapport Telegram condensé : ✅ tout OK ou liste des problèmes.
+    """
+    import sqlite3
+    from config import DB_PATH, MODELS_DIR, FD_DAILY_LIMIT
+    problems = []
+
+    # 1. Modèles chargeables
+    for sport, mdl in (("football", football_model), ("NBA", nba_model), ("OU", ou_model), ("BTTS", btts_model)):
+        if not mdl.is_trained:
+            problems.append(f"Modèle {sport} non chargé — relancer le retraining")
+
+    # 2. DB accessible + cohérente
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        bad  = conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE kelly_stake IS NULL AND outcome IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        if bad > 0:
+            problems.append(f"DB incohérente : {bad} prédiction(s) avec kelly_stake NULL")
+    except Exception as e:
+        problems.append(f"DB inaccessible : {e}")
+
+    # 3. Quota football-data.org
+    try:
+        used      = get_fd_quota_used()
+        remaining = FD_DAILY_LIMIT - used
+        if remaining < 20:
+            problems.append(f"Quota FD faible : {remaining} requêtes restantes ({used}/{FD_DAILY_LIMIT})")
+    except Exception as e:
+        problems.append(f"Vérification quota FD échouée : {e}")
+
+    # 4. Espace disque libre
+    try:
+        usage      = shutil.disk_usage(".")
+        free_mb    = usage.free / (1024 * 1024)
+        if free_mb < 500:
+            problems.append(f"Disque critique : {free_mb:.0f} Mo libres (seuil 500 Mo)")
+    except Exception as e:
+        problems.append(f"Vérification disque échouée : {e}")
+
+    # Rapport Telegram
+    if problems:
+        lines = ["⚠️ <b>HEALTHCHECK BetMind — PROBLÈMES DÉTECTÉS</b>", ""]
+        for p in problems:
+            lines.append(f"  ❌ {p}")
+        lines += ["", "🤖 BetMind Agent"]
+        logger.warning(f"Healthcheck : {len(problems)} problème(s) détecté(s)")
+    else:
+        lines = [
+            "✅ <b>HEALTHCHECK BetMind — Tout OK</b>",
+            "",
+            "  • Modèles : football ✓ | NBA ✓ | OU ✓",
+            f"  • DB : accessible et cohérente",
+            f"  • Quota FD : {FD_DAILY_LIMIT - get_fd_quota_used()} req. restantes",
+            f"  • Disque : {shutil.disk_usage('.').free / (1024*1024):.0f} Mo libres",
+            "",
+            "🤖 BetMind Agent",
+        ]
+        logger.info("Healthcheck : tout OK")
+
+    send_message("\n".join(lines))
+
+
 def start_scheduler():
     logger.info("Scheduler démarré.")
+    schedule.every().day.at("07:30").do(run_health_check)      # healthcheck avant cycle
     schedule.every().day.at("08:00").do(run_with_results)
     schedule.every().day.at("18:00").do(run_with_results)
     schedule.every().day.at("22:00").do(run_nba_predictions)
     schedule.every().day.at("23:30").do(send_daily_report)    # résumé fin de journée
+    schedule.every().day.at("02:00").do(backup_database)       # backup DB quotidien
     schedule.every().day.at("10:00").do(check_silence)        # monitoring quotidien
     schedule.every().monday.at("09:00").do(send_weekly_report)
     schedule.every().monday.at("03:00").do(retrain_models)  # 1er lundi du mois seulement
