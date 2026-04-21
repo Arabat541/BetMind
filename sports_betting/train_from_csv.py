@@ -17,6 +17,9 @@ import sys
 import warnings
 from datetime import timedelta
 
+from understat_fetcher import load_xg_history, get_team_xg_rolling
+from transfermarkt_fetcher import load_squad_values, get_squad_value_features
+
 import numpy as np
 import pandas as pd
 import requests
@@ -134,6 +137,12 @@ FEATURE_COLS = [
     "home_elo", "away_elo", "elo_diff",
     # Feature arbitre — X
     "referee_avg_goals", "referee_home_bias",
+    # xG réel Understat — W
+    "home_xg_avg", "away_xg_avg",
+    "home_xga_avg", "away_xga_avg",
+    "xg_diff", "xga_diff",
+    # Valeur marchande effectifs — Y
+    "home_squad_value", "away_squad_value", "squad_value_ratio",
 ]
 
 
@@ -526,13 +535,58 @@ def _extract_odds(row: pd.Series) -> tuple:
     return None, None, None
 
 
+def _get_xg_features(home: str, away: str, date: str,
+                     xg_history: dict | None) -> dict:
+    """
+    Retourne les features xG Understat pour home et away avant `date`.
+    Fallback à 0.0 si données absentes (modèle reste robuste via shots proxy).
+    """
+    default = {
+        "home_xg_avg":  0.0, "away_xg_avg":  0.0,
+        "home_xga_avg": 0.0, "away_xga_avg": 0.0,
+        "xg_diff": 0.0, "xga_diff": 0.0,
+    }
+    if not xg_history:
+        return default
+
+    h_stats = get_team_xg_rolling(xg_history, home, before_date=date, window=8)
+    a_stats = get_team_xg_rolling(xg_history, away, before_date=date, window=8)
+
+    home_xg  = h_stats["xg_avg"]
+    away_xg  = a_stats["xg_avg"]
+    home_xga = h_stats["xga_avg"]
+    away_xga = a_stats["xga_avg"]
+
+    return {
+        "home_xg_avg":  home_xg,
+        "away_xg_avg":  away_xg,
+        "home_xga_avg": home_xga,
+        "away_xga_avg": away_xga,
+        "xg_diff":  round(home_xg  - away_xg,  4),
+        "xga_diff": round(home_xga - away_xga, 4),
+    }
+
+
+def _get_squad_value_features(home: str, away: str,
+                              squad_values: dict | None) -> dict:
+    """
+    Retourne les features de valeur marchande (Transfermarkt).
+    Fallback à ratio=1.0 si données absentes.
+    """
+    if not squad_values:
+        return {"home_squad_value": 100.0, "away_squad_value": 100.0, "squad_value_ratio": 1.0}
+    return get_squad_value_features(squad_values, home, away)
+
+
 def build_row_features(row: pd.Series,
                        history: dict, dates_dict: dict,
                        h2h_db: dict,
                        standings_cache: dict,
                        n_teams: int,
                        elo_before: dict | None = None,
-                       referee_stats: dict | None = None) -> dict | None:
+                       referee_stats: dict | None = None,
+                       xg_history: dict | None = None,
+                       squad_values: dict | None = None) -> dict | None:
     home   = row["HomeTeam"]
     away   = row["AwayTeam"]
     date   = row["Date"]
@@ -676,6 +730,10 @@ def build_row_features(row: pd.Series,
         ),
         # Feature arbitre — X
         **_get_referee_features(getattr(row, "Referee", None), referee_stats),
+        # xG réel Understat — W
+        **_get_xg_features(home, away, date, xg_history),
+        # Valeur marchande effectifs — Y
+        **_get_squad_value_features(home, away, squad_values),
     }
 
 
@@ -992,6 +1050,20 @@ def train():
     logger.info("Précomputation stats arbitres...")
     referee_stats = _precompute_referee_stats(all_df)
 
+    logger.info("Chargement xG Understat...")
+    xg_history = load_xg_history()
+    if xg_history:
+        logger.info(f"  xG disponible pour {len(xg_history)} équipes")
+    else:
+        logger.info("  xG Understat absent — features xG=0 (relancer understat_fetcher.py)")
+
+    logger.info("Chargement valeurs marchandes Transfermarkt...")
+    squad_values = load_squad_values()
+    if squad_values:
+        logger.info(f"  Squad values disponibles pour {len(squad_values)} équipes")
+    else:
+        logger.info("  Squad values absentes — ratio=1.0 (relancer transfermarkt_fetcher.py)")
+
     logger.info("Précomputation des classements temporels...")
     standings_cache: dict = {}
     for league_name, code in LEAGUES.items():
@@ -1021,6 +1093,8 @@ def train():
             row, history, dates_dict, h2h_db, standings_cache, n_teams,
             elo_before=elo_before,
             referee_stats=referee_stats,
+            xg_history=xg_history,
+            squad_values=squad_values,
         )
         if feats is None:
             continue

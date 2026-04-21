@@ -11,6 +11,8 @@ from data_fetcher import (
     fetch_match_weather, get_team_elo,
 )
 from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
+from understat_fetcher import load_xg_history, get_team_xg_rolling
+from transfermarkt_fetcher import load_squad_values, get_squad_value_features
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,24 @@ def build_football_features(home_id: int, away_id: int,
         "away_elo":  away_elo,
         "elo_diff":  round(home_elo - away_elo, 1),
     })
+
+    # ── xG réel Understat — W ────────────────────────────────
+    xg_hist  = load_xg_history()
+    today    = __import__("datetime").date.today().isoformat()
+    h_xg     = get_team_xg_rolling(xg_hist, home_name, before_date=today, window=8)
+    a_xg     = get_team_xg_rolling(xg_hist, away_name, before_date=today, window=8)
+    features.update({
+        "home_xg_avg":  h_xg["xg_avg"],
+        "away_xg_avg":  a_xg["xg_avg"],
+        "home_xga_avg": h_xg["xga_avg"],
+        "away_xga_avg": a_xg["xga_avg"],
+        "xg_diff":  round(h_xg["xg_avg"]  - a_xg["xg_avg"],  4),
+        "xga_diff": round(h_xg["xga_avg"] - a_xg["xga_avg"], 4),
+    })
+
+    # ── Valeur marchande effectifs — Y ───────────────────────
+    sq_vals = load_squad_values()
+    features.update(get_squad_value_features(sq_vals, home_name, away_name))
 
     return features
 
@@ -317,6 +337,12 @@ def get_feature_columns(sport: str = "football") -> list:
             # Cotes de fermeture — AB
             "impl_cl_home", "impl_cl_draw", "impl_cl_away",
             "cl_move_home", "cl_move_draw", "cl_move_away",
+            # xG réel Understat — W
+            "home_xg_avg", "away_xg_avg",
+            "home_xga_avg", "away_xga_avg",
+            "xg_diff", "xga_diff",
+            # Valeur marchande effectifs — Y
+            "home_squad_value", "away_squad_value", "squad_value_ratio",
         ]
     elif sport == "ou_football":
         return [
