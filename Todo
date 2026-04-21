@@ -81,17 +81,15 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
   dixon_coles.py — τ correction, calibration ρ MLE, dc_1x2/dc_over_under/dc_correct_scores
   Intégré dans model.py (blend 70% XGB + 30% DC sur OU) et train_from_csv.py (calibration auto)
 
-### AJ — LSTM / séquences temporelles
-  RNN sur les 10 derniers matchs de chaque équipe
-  Capture les tendances de forme mieux que les moyennes glissantes
-  Feature engineered depuis les séquences W/D/L + buts + xG
-  Attendu : +2-3% accuracy
+### ✅ AJ — LSTM / séquences temporelles — FAIT
+  form_lstm.py — LSTM(32) sur séquences 10 matchs × 8 features (résultat, buts, home, xG)
+  Fallback numpy EWM + pente linéaire si Keras absent
+  home/away_lstm_form + lstm_form_diff dans FEATURE_COLS + entraîné par train_from_csv.py
 
-### AK — Player-level xG (impact blessures précis)
-  Calculer la contribution xG de chaque joueur absent
-  Remplace le comptage brut blessures par l'impact réel sur les xG équipe
-  Source : Understat player stats
-  Attendu : +1% accuracy
+### ✅ AK — Player-level xG (impact blessures précis) — FAIT
+  understat_fetcher.py — fetch_and_save_player_xg(), get_player_xg_loss()
+  home/away_xg_loss + xg_loss_pct + top_scorer_share dans FEATURE_COLS
+  retrain.sh étape 0/4 : refresh player xG automatique
 
 ### ✅ AL — Modèle Correct Score (Poisson bivarié) — FAIT
   build_correct_score_signal() dans model.py — dc_correct_scores, edge ≥ 12%, prob ≥ 8%
