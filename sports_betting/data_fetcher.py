@@ -771,50 +771,60 @@ def get_injury_stats(injuries_dict: dict, team_name: str) -> dict:
 def init_db():
     """Initialise la base de données (SQLite ou PostgreSQL via db.py)."""
     import os
-    from db import get_conn, adapt_ddl, is_postgres, ph
+    from db import get_conn, adapt_ddl, is_postgres, raw_conn
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # CREATE TABLE dans une transaction propre
     with get_conn() as conn:
-      c = conn.cursor()
-      c.execute(adapt_ddl("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at   TEXT    DEFAULT (datetime('now')),
-            sport        TEXT, league TEXT, home_team TEXT, away_team TEXT,
-            match_date   TEXT, pred_result TEXT,
-            prob_home    REAL, prob_draw REAL, prob_away REAL,
-            confidence   REAL, is_value_bet INTEGER DEFAULT 0,
-            edge         REAL, kelly_stake REAL, odd_used REAL,
-            outcome      TEXT DEFAULT NULL, pnl REAL DEFAULT NULL,
-            home_injuries_out REAL DEFAULT 0, home_injuries_dtd REAL DEFAULT 0,
-            away_injuries_out REAL DEFAULT 0, away_injuries_dtd REAL DEFAULT 0,
-            method       TEXT DEFAULT NULL,
-            odd_closing  REAL DEFAULT NULL
-        )
-      """))
-      # Migrations : ajouter colonnes manquantes
-      _migrations = [
-          ("home_injuries_out",    "REAL DEFAULT 0"),
-          ("home_injuries_dtd",    "REAL DEFAULT 0"),
-          ("away_injuries_out",    "REAL DEFAULT 0"),
-          ("away_injuries_dtd",    "REAL DEFAULT 0"),
-          ("method",               "TEXT DEFAULT NULL"),
-          ("odd_closing",          "REAL DEFAULT NULL"),
-          ("odd_opening",          "REAL DEFAULT NULL"),
-          ("opening_movement_pct", "REAL DEFAULT NULL"),
-          ("market",               "TEXT DEFAULT NULL"),
-      ]
-      for col, col_type in _migrations:
-          try:
-              c.execute(f"ALTER TABLE predictions ADD COLUMN {col} {col_type}")
-          except Exception:
-              pass  # colonne déjà présente
-      c.execute(adapt_ddl("""
-        CREATE TABLE IF NOT EXISTS bankroll (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            updated_at TEXT DEFAULT (datetime('now')),
-            balance    REAL, total_bets INTEGER, wins INTEGER, losses INTEGER, roi REAL
-        )
-      """))
+        c = conn.cursor()
+        c.execute(adapt_ddl("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at   TEXT    DEFAULT (datetime('now')),
+                sport        TEXT, league TEXT, home_team TEXT, away_team TEXT,
+                match_date   TEXT, pred_result TEXT,
+                prob_home    REAL, prob_draw REAL, prob_away REAL,
+                confidence   REAL, is_value_bet INTEGER DEFAULT 0,
+                edge         REAL, kelly_stake REAL, odd_used REAL,
+                outcome      TEXT DEFAULT NULL, pnl REAL DEFAULT NULL,
+                home_injuries_out REAL DEFAULT 0, home_injuries_dtd REAL DEFAULT 0,
+                away_injuries_out REAL DEFAULT 0, away_injuries_dtd REAL DEFAULT 0,
+                method       TEXT DEFAULT NULL,
+                odd_closing  REAL DEFAULT NULL
+            )
+        """))
+        c.execute(adapt_ddl("""
+            CREATE TABLE IF NOT EXISTS bankroll (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                updated_at TEXT DEFAULT (datetime('now')),
+                balance    REAL, total_bets INTEGER, wins INTEGER, losses INTEGER, roi REAL
+            )
+        """))
+
+    # Migrations colonnes — chacune dans sa propre transaction
+    # PostgreSQL : utilise ADD COLUMN IF NOT EXISTS (9.6+)
+    # SQLite     : try/except sur la transaction individuelle
+    _migrations = [
+        ("home_injuries_out",    "REAL DEFAULT 0"),
+        ("home_injuries_dtd",    "REAL DEFAULT 0"),
+        ("away_injuries_out",    "REAL DEFAULT 0"),
+        ("away_injuries_dtd",    "REAL DEFAULT 0"),
+        ("method",               "TEXT DEFAULT NULL"),
+        ("odd_closing",          "REAL DEFAULT NULL"),
+        ("odd_opening",          "REAL DEFAULT NULL"),
+        ("opening_movement_pct", "REAL DEFAULT NULL"),
+        ("market",               "TEXT DEFAULT NULL"),
+    ]
+    if_not_exists = "IF NOT EXISTS " if is_postgres() else ""
+    for col, col_type in _migrations:
+        try:
+            with get_conn() as conn:
+                conn.execute(
+                    f"ALTER TABLE predictions ADD COLUMN {if_not_exists}{col} {col_type}"
+                )
+        except Exception:
+            pass  # colonne déjà présente
+
     logger.info("Database initialized.")
 
 
