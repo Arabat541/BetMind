@@ -40,6 +40,28 @@ class EnsembleModel:
 
         return probas
 
+    def predict_proba_with_variance(self, X) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Retourne (probas, variance) où variance est l'écart-type max entre
+        les deux base-learners (XGB vs LGB) par outcome.
+        variance[i] = max std across outcomes for sample i.
+        Variance élevée (> 0.08) = désaccord entre modèles → signal peu fiable.
+        """
+        p_xgb = self.xgb_model.predict_proba(X)   # (n, 3)
+        p_lgb = self.lgb_model.predict_proba(X)    # (n, 3)
+
+        stacked = np.stack([p_xgb, p_lgb], axis=0)  # (2, n, 3)
+        std_per_outcome = stacked.std(axis=0)        # (n, 3)
+        max_std = std_per_outcome.max(axis=1)        # (n,) — pire désaccord par sample
+
+        # Probas finales via méta-modèle + calibration
+        meta_X = np.hstack([p_xgb, p_lgb])
+        probas = self.meta_model.predict_proba(meta_X)
+        if self.cal_models is not None:
+            probas = self._apply_calibration(probas)
+
+        return probas, max_std
+
     def _apply_calibration(self, probas: np.ndarray) -> np.ndarray:
         """Applique la calibration isotonic par classe puis renormalise."""
         calibrated = np.column_stack([

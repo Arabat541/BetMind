@@ -436,6 +436,36 @@ def fetch_match_weather(home_team: str, match_datetime=None) -> dict:
         return default
 
 
+# ── ELO lookup (chargé depuis data/elo_ratings_current.json) ──
+_elo_cache: dict = {}
+
+def get_team_elo(team_name: str, default: float = 1500.0) -> float:
+    """
+    Retourne le rating ELO courant d'une équipe.
+    Données générées par train_from_csv.py → data/elo_ratings_current.json.
+    Fallback : 1500 (rating initial) si équipe inconnue.
+    """
+    global _elo_cache
+    if not _elo_cache:
+        elo_path = os.path.join(DATA_DIR, "elo_ratings_current.json")
+        if os.path.exists(elo_path):
+            try:
+                with open(elo_path, "r", encoding="utf-8") as f:
+                    _elo_cache = json.load(f)
+            except Exception:
+                _elo_cache = {}
+
+    # Recherche exacte puis sur premier mot
+    val = _elo_cache.get(team_name)
+    if val is None:
+        first = team_name.split()[0].lower()
+        for k, v in _elo_cache.items():
+            if k.lower().startswith(first):
+                val = v
+                break
+    return float(val) if val is not None else default
+
+
 # ── Shots lookup (chargé depuis data/team_shots_current.json) ─
 _team_shots_cache: dict = {}
 

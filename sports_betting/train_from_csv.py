@@ -79,6 +79,12 @@ MODEL_PATH        = os.path.join(MODELS_DIR, "football_xgb_model.pkl")
 ENSEMBLE_PATH     = os.path.join(MODELS_DIR, "football_ensemble_model.pkl")
 BEST_PARAMS_PATH  = os.path.join(MODELS_DIR, "best_params_football.json")
 TEAM_SHOTS_PATH   = os.path.join(DATA_DIR,   "team_shots_current.json")
+ELO_PATH          = os.path.join(DATA_DIR,   "elo_ratings_current.json")
+
+# ── ELO config ───────────────────────────────────────────────
+ELO_K             = 20      # facteur de mise à jour standard football
+ELO_START         = 1500    # rating initial
+ELO_HOME_ADV      = 100     # avantage domicile en points ELO (dans E_expected)
 
 # ── Colonnes features ────────────────────────────────────────
 FEATURE_COLS = [
@@ -110,6 +116,9 @@ FEATURE_COLS = [
     # Cotes bookmaker (signal le plus fort — Bet365 ou moyenne)
     "impl_home", "impl_draw", "impl_away",
     "odd_home", "odd_draw", "odd_away", "has_odds",
+    # Cotes de fermeture (AB) — proxy marché efficient
+    "impl_cl_home", "impl_cl_draw", "impl_cl_away",
+    "cl_move_home", "cl_move_draw", "cl_move_away",
     # Shots (proxy xG) — A
     "home_sot_avg", "away_sot_avg",
     "home_sot_ag_avg", "away_sot_ag_avg",
@@ -121,6 +130,10 @@ FEATURE_COLS = [
     # Motivation / enjeu — G
     "home_relegation_gap", "away_relegation_gap",
     "home_title_gap",      "away_title_gap",
+    # ELO dynamique — S
+    "home_elo", "away_elo", "elo_diff",
+    # Feature arbitre — X
+    "referee_avg_goals", "referee_home_bias",
 ]
 
 
@@ -241,6 +254,118 @@ def _build_standings_timeline(df_ls: pd.DataFrame, n_teams: int) -> dict:
                 pts[a] += 3
 
     return timeline
+
+
+# ════════════════════════════════════════════════════════════
+# ELO DYNAMIQUE — S
+# ════════════════════════════════════════════════════════════
+
+def _precompute_referee_stats(all_df: pd.DataFrame) -> dict:
+    """
+    Calcule pour chaque arbitre (colonne Referee) les statistiques historiques :
+    - avg_goals  : buts moyens par match arbitré
+    - home_bias  : P(victoire domicile) quand cet arbitre officie
+
+    Retourne {referee_name: {"avg_goals": float, "home_bias": float}}
+    ou {} si la colonne Referee est absente.
+    """
+    if "Referee" not in all_df.columns or all_df["Referee"].isna().all():
+        return {}
+
+    stats: dict = {}
+    for ref, grp in all_df.dropna(subset=["Referee"]).groupby("Referee"):
+        total_goals = (grp["FTHG"] + grp["FTAG"]).mean()
+        home_wins   = (grp["FTR"] == "H").sum() / len(grp)
+        stats[str(ref)] = {
+            "avg_goals": round(float(total_goals), 3),
+            "home_bias": round(float(home_wins), 3),
+        }
+    return stats
+
+
+def _precompute_elo(all_df: pd.DataFrame) -> dict:
+    """
+    Calcule les ratings ELO de chaque équipe au fil des matchs (chronologique).
+    Retourne elo_before[team] = [(date, elo_avant_ce_match), ...]
+    Triés par date — permet lookup O(log n) avec bisect.
+
+    Formule standard :
+      E_home = 1 / (1 + 10^((elo_away - elo_home - ELO_HOME_ADV) / 400))
+      delta   = K * (score - E_expected)
+      score   = 1 (victoire), 0.5 (nul), 0 (défaite)
+    """
+    ratings: dict[str, float] = {}   # rating courant par équipe
+    before:  dict[str, list]  = {}   # (date, elo) avant chaque match
+
+    for row in all_df.sort_values("Date").itertuples(index=False):
+        h, a = row.HomeTeam, row.AwayTeam
+        hg, ag = int(row.FTHG), int(row.FTAG)
+        date = row.Date
+
+        r_h = ratings.get(h, ELO_START)
+        r_a = ratings.get(a, ELO_START)
+
+        # Enregistrer AVANT la mise à jour
+        for team, r in [(h, r_h), (a, r_a)]:
+            if team not in before:
+                before[team] = []
+            before[team].append((date, round(r, 1)))
+
+        # Probabilité attendue (avec avantage domicile)
+        e_h = 1.0 / (1.0 + 10 ** ((r_a - r_h - ELO_HOME_ADV) / 400.0))
+        e_a = 1.0 - e_h
+
+        # Score réel
+        if hg > ag:
+            s_h, s_a = 1.0, 0.0
+        elif hg == ag:
+            s_h, s_a = 0.5, 0.5
+        else:
+            s_h, s_a = 0.0, 1.0
+
+        ratings[h] = r_h + ELO_K * (s_h - e_h)
+        ratings[a] = r_a + ELO_K * (s_a - e_a)
+
+    # Trier chaque liste par date pour bisect
+    for team in before:
+        before[team].sort(key=lambda x: x[0])
+
+    return before, ratings   # ratings = ELO final (pour sauvegarde live)
+
+
+def _get_elo(elo_before: dict, team: str, before_date) -> float:
+    """Retourne l'ELO d'une équipe juste avant before_date."""
+    entries = elo_before.get(team)
+    if not entries:
+        return ELO_START
+    dates = [e[0] for e in entries]
+    idx   = bisect.bisect_left(dates, before_date)
+    if idx == 0:
+        return ELO_START
+    return entries[idx - 1][1]
+
+
+def _get_referee_features(referee, referee_stats: dict | None) -> dict:
+    """Retourne les features arbitre ou les moyennes globales si inconnu."""
+    default = {"referee_avg_goals": 2.5, "referee_home_bias": 0.45}
+    if not referee_stats or not referee:
+        return default
+    ref_str = str(referee).strip()
+    data    = referee_stats.get(ref_str)
+    if not data:
+        return default
+    return {
+        "referee_avg_goals": data["avg_goals"],
+        "referee_home_bias": data["home_bias"],
+    }
+
+
+def save_elo_lookup(ratings: dict):
+    """Sauvegarde les ratings ELO courants pour les prédictions live."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(ELO_PATH, "w") as f:
+        json.dump({k: round(v, 1) for k, v in ratings.items()}, f, indent=2)
+    logger.info(f"ELO sauvegardé : {ELO_PATH} ({len(ratings)} équipes)")
 
 
 # ════════════════════════════════════════════════════════════
@@ -365,6 +490,23 @@ def _get_rank(timeline: dict, team: str, date, n_teams: int) -> int:
     return n_teams // 2
 
 
+def _extract_closing_odds(row: pd.Series) -> tuple:
+    """Extrait les cotes de fermeture (BbCl* en priorité, sinon BbAv*)."""
+    for h_col, d_col, a_col in [
+        ("BbClH", "BbClD", "BbClA"),
+        ("BbAvH", "BbAvD", "BbAvA"),
+    ]:
+        try:
+            oh = float(row.get(h_col, 0) or 0)
+            od = float(row.get(d_col, 0) or 0)
+            oa = float(row.get(a_col, 0) or 0)
+            if oh > 1.0 and od > 1.0 and oa > 1.0:
+                return oh, od, oa
+        except (TypeError, ValueError):
+            continue
+    return None, None, None
+
+
 def _extract_odds(row: pd.Series) -> tuple:
     """Tente d'extraire les cotes depuis plusieurs colonnes bookmaker."""
     for h_col, d_col, a_col in [
@@ -388,7 +530,9 @@ def build_row_features(row: pd.Series,
                        history: dict, dates_dict: dict,
                        h2h_db: dict,
                        standings_cache: dict,
-                       n_teams: int) -> dict | None:
+                       n_teams: int,
+                       elo_before: dict | None = None,
+                       referee_stats: dict | None = None) -> dict | None:
     home   = row["HomeTeam"]
     away   = row["AwayTeam"]
     date   = row["Date"]
@@ -424,6 +568,20 @@ def build_row_features(row: pd.Series,
     else:
         impl_h, impl_d, impl_a = 0.33, 0.33, 0.33
         odd_h, odd_d, odd_a    = 2.5, 3.3, 2.5
+
+    # Closing odds — AB (marché efficient)
+    cl_h, cl_d, cl_a = _extract_closing_odds(row)
+    if cl_h:
+        cl_tot     = 1/cl_h + 1/cl_d + 1/cl_a
+        impl_cl_h  = round((1/cl_h) / cl_tot, 4)
+        impl_cl_d  = round((1/cl_d) / cl_tot, 4)
+        impl_cl_a  = round((1/cl_a) / cl_tot, 4)
+    else:
+        impl_cl_h, impl_cl_d, impl_cl_a = impl_h, impl_d, impl_a
+    # Mouvement ouverture→fermeture (>0 = cote a baissé = marché plus confiant)
+    cl_move_h = round(impl_cl_h - impl_h, 4)
+    cl_move_d = round(impl_cl_d - impl_d, 4)
+    cl_move_a = round(impl_cl_a - impl_a, 4)
 
     # Motivation / classement
     cache_key  = f"{league}_{season}"
@@ -483,6 +641,13 @@ def build_row_features(row: pd.Series,
         "odd_draw":              round(odd_d, 3),
         "odd_away":              round(odd_a, 3),
         "has_odds":              has_odds,
+        # Cotes de fermeture — AB
+        "impl_cl_home":          impl_cl_h,
+        "impl_cl_draw":          impl_cl_d,
+        "impl_cl_away":          impl_cl_a,
+        "cl_move_home":          cl_move_h,
+        "cl_move_draw":          cl_move_d,
+        "cl_move_away":          cl_move_a,
         # Shots (proxy xG)
         "home_sot_avg":          hs["sot_avg"],
         "away_sot_avg":          ass["sot_avg"],
@@ -502,6 +667,15 @@ def build_row_features(row: pd.Series,
         "away_relegation_gap":   round((rel_thresh - away_rank) / n_teams, 4),
         "home_title_gap":        round((home_rank - 1) / n_teams, 4),
         "away_title_gap":        round((away_rank - 1) / n_teams, 4),
+        # ELO dynamique — S
+        "home_elo":  round(_get_elo(elo_before, home, date) if elo_before else ELO_START, 1),
+        "away_elo":  round(_get_elo(elo_before, away, date) if elo_before else ELO_START, 1),
+        "elo_diff":  round(
+            (_get_elo(elo_before, home, date) if elo_before else ELO_START) -
+            (_get_elo(elo_before, away, date) if elo_before else ELO_START), 1
+        ),
+        # Feature arbitre — X
+        **_get_referee_features(getattr(row, "Referee", None), referee_stats),
     }
 
 
@@ -811,6 +985,13 @@ def train():
     history, dates_dict, _ = _precompute_histories(all_df)
     h2h_db                 = _precompute_h2h(all_df)
 
+    logger.info("Précomputation ELO dynamique...")
+    elo_before, elo_final = _precompute_elo(all_df)
+    save_elo_lookup(elo_final)
+
+    logger.info("Précomputation stats arbitres...")
+    referee_stats = _precompute_referee_stats(all_df)
+
     logger.info("Précomputation des classements temporels...")
     standings_cache: dict = {}
     for league_name, code in LEAGUES.items():
@@ -837,7 +1018,9 @@ def train():
 
         n_teams = LEAGUE_N_TEAMS.get(row.get("league_code", ""), 20)
         feats   = build_row_features(
-            row, history, dates_dict, h2h_db, standings_cache, n_teams
+            row, history, dates_dict, h2h_db, standings_cache, n_teams,
+            elo_before=elo_before,
+            referee_stats=referee_stats,
         )
         if feats is None:
             continue

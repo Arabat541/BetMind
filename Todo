@@ -12,79 +12,90 @@
   predictor.py charge l'ensemble en priorité via model.py
 ### ✅ E — Fatigue / densité de calendrier — FAIT
 ### ✅ G — Feature "motivation" / enjeu du match — FAIT
-
-
 ### ✅ F — Marché BTTS (Both Teams To Score) — FAIT
-  train_btts.py : 6775 matchs, Accuracy 53.0% ± 3.0%
-  Modèle sauvegardé : btts_football_xgb_model.pkl
-  Signal BTTS intégré dans run_football_predictions() (edge min 7%)
-  fetch_football_btts_odds() ajouté dans data_fetcher.py
-  build_btts_signal() + detect_btts_value_bet() dans model.py
-
-### ✅ H — Signal cote d'ouverture vs cote actuelle — FAIT
-  odd_opening sauvegardé en DB au moment de la prédiction (= odd_used initial)
-  opening_movement_pct calculé et stocké à chaque check_odds_movement()
-  Mouvement < -5% → mise annulée (marché contre nous)
-  Mouvement > +5% → log "Sharp money ✓" (sharps confirment notre pari)
-  Colonnes DB ajoutées : odd_opening, opening_movement_pct, market
-
-
+### ✅ H — Signal cote d'ouverture vs cote actuelle (Sharp Money) — FAIT
 ### ✅ I — SHAP values feature importance — FAIT
-  compute_shap() dans train_from_csv.py : TreeExplainer sur XGBClassifier brut
-  Top 10 features loguées + graphique sauvegardé : models/shap_football.png
-  Échantillon 2000 matchs, headless matplotlib (Agg backend)
-
 ### ✅ J — Données météo — FAIT
-  fetch_match_weather(home_team) dans data_fetcher.py (OpenWeatherMap forecast)
-  OPENWEATHER_KEY dans .env (plan gratuit, 60 req/min)
-  feature binaire rainy_match : pluie > 2mm/h OU vent > 30 km/h → 1
-  60 stades GPS dans STADIUM_COORDS (config.py) — 5 ligues couvertes
-  feature rainy_match ajoutée dans build_football_features() + get_feature_columns()
-
 ### ✅ K — Asian Handicap -0.5 — FAIT
-  detect_ah_value_bet() dans model.py : P(AH) = P(home)/(P(home)+P(away))
-  fetch_football_ah_odds() dans data_fetcher.py (marché asian_handicap)
-  Signal AH inséré dans run_football_predictions() (edge min 6%)
-  Pas de modèle séparé — dérivé des probas du modèle football existant
-
 ### ✅ Dashboard v2.0 — FAIT
-  Brier Score KPI, modèles status (ensemble/XGB/OU/BTTS/NBA)
-  Marchés couverts donut chart, Sharp money section
-  Colonne Marché + badges OVER/UNDER/BTTS/AH dans la table prédictions
-  Filtre marché dans la table, Performance par marché table
-  Routes : /api/models_status /api/market_stats /api/brier_score /api/sharp_money
-
 ### ✅ L — Calibration isotonic sur l'EnsembleModel — FAIT
-  EnsembleModel.calibrate() : IsotonicRegression × 3 classes sur OOF probas
-  Appelé automatiquement dans train_ensemble() après le méta-modèle
-  probas renormalisées après calibration (clip + sum=1)
-
-### ✅ N — Retrain automatique hebdomadaire — FAIT
-  retrain.sh : lance train_from_csv.py + train_over_under.py + train_btts.py
-  Notification Telegram démarrage + fin (succès/erreur)
-  Rotation automatique des 5 derniers logs retrain_YYYYMMDD_HHMMSS.log
-  Cron suggéré : 0 3 * * 1  (lundi 3h UTC)
-  Installer : crontab -e → 0 3 * * 1 /home/evrard/apps/betmind/retrain.sh
-
+### ✅ N — Retrain automatique hebdomadaire (retrain.sh + cron) — FAIT
 ### ✅ O — Stop-loss dynamique par ligue — FAIT
-  BankrollTracker.is_league_suspended(league) dans bankroll.py
-  Critères sur 10 derniers paris de la ligue :
-    - ≥ 5 défaites consécutives → suspension
-    - ROI < -20% sur 10 paris → suspension
-  Vérifié dans run_football_predictions() avant chaque pari (après diversification)
-
-### ✅ Q — Alertes Telegram enrichies — FAIT
-  send_prediction_alert() dans telegram_bot.py :
-    - Sharp money : affiche mouvement cote ↓/↑ avec % si abs(mvt) > 5%
-    - Météo : affiche 🌧️ mm/h + 💨 km/h + 🌡️ °C si rainy_match=1
-
 ### ✅ P — Backtesting interactif dans le dashboard — FAIT
-  Section "Backtesting — Simuler une période" avec slider dates + filtres sport/marché
-  Route /api/backtest?from=&to=&sport=&market= → KPIs + courbe P&L cumulé
-  Chart.js line chart du P&L cumulé sur la période, Brier Score inclus
-
+### ✅ Q — Alertes Telegram enrichies (sharp money + météo) — FAIT
 ### ✅ M — Arbitrage / implied value multi-bookmakers — FAIT
-  detect_arbitrage(odds_by_bookmaker) dans model.py : arb_pct si somme inverses < 1
-  detect_implied_value(model_proba, odds_by_bookmaker) : value bets cross-bookmaker
-  Loggé dans run_football_predictions() après chaque signal 1X2
-  deploy.sh : redémarre betmind + betmind-dashboard après chaque déploiement
+### ✅ R — deploy.sh redémarre betmind + betmind-dashboard — FAIT
+
+
+## 🔴 Priorité 1 — Impact élevé modèle
+
+### S — ELO dynamique par équipe
+  Rating ELO mis à jour après chaque match (O(1) par match)
+  Feature home_elo, away_elo, elo_diff ajoutées dans FEATURE_COLS
+  Calcul dans train_from_csv.py + sauvegarde models/elo_ratings.json
+  Attendu : +1-2% accuracy
+
+### T — Suppression du vig (Shin method)
+  Convertir les cotes bookmaker en probas "propres" sans margin (≈5%)
+  Fonction shin_probabilities(odd_H, odd_D, odd_A) dans model.py
+  Edge calculé vs vraie proba implicite → moins de faux positifs
+  Attendu : meilleure fiabilité de l'edge détecté
+
+### U — Variance ensemble comme filtre de rejet
+  Calculer std(prob_home_xgb, prob_home_lgb) par outcome
+  Si std > 0.08 → prédiction incohérente entre modèles → skip ou réduire mise
+  Ajout champ pred_variance dans signal + colonne dashboard
+
+### V — CLV (Closing Line Value) comme KPI principal
+  get_avg_clv() existe déjà dans bankroll.py mais non utilisé
+  Afficher CLV moyen dans dashboard KPIs + alerte Telegram hebdo
+  Si CLV moyen < 0 sur 30 derniers paris → alerte "edge perdu"
+  Standard de l'industrie pour mesurer si l'edge est réel
+
+
+## 🟠 Priorité 2 — Données supplémentaires
+
+### W — xG réel depuis Understat (scraping)
+  fetch_understat_xg(team, season) via understatapi ou scraping HTML
+  Remplace shots proxy (corrélation 0.85) par vraies valeurs xG
+  Attendu : +1% accuracy
+
+### X — Feature arbitre
+  Colonne Referee disponible dans football-data.co.uk CSVs
+  Features : referee_avg_goals, referee_home_bias (sur 2 saisons)
+  Signal niche — utile pour les matchs à enjeu
+
+### Y — Valeur marchande effectifs (Transfermarkt)
+  Squad value comme proxy de qualité réelle (surtout début de saison)
+  Scraping simple : home_squad_value, away_squad_value, value_ratio
+  Stabilise les prédictions quand la forme récente est peu significative
+
+
+## 🟡 Priorité 3 — Stratégie & Risk Management
+
+### Z — Corrélation entre marchés (signal combiné)
+  Si BTTS=oui ET O/U>2.5 signalent le même match → mise combinée +20%
+  Si signaux contradictoires (BTTS=non ET O/U>2.5) → ignorer les deux
+  Logique dans predictor.py après génération des signaux
+
+### AA — Drawdown global stop-loss
+  Si drawdown > 20% depuis le peak bankroll → pause complète
+  Actuellement : stop-loss journalier + par ligue, mais pas de stop global
+  Alerte Telegram + flag dans DB → aucune nouvelle mise jusqu'à review
+
+### AB — Odd de fermeture comme feature modèle
+  odd_closing comme feature dans FEATURE_COLS (pas seulement signal post-prédiction)
+  Capture l'information agrégée des sharps avant le match
+  Disponible via The Odds API (historical closing lines)
+
+
+## 🟢 Priorité 4 — Infrastructure
+
+### AC — MLflow model registry
+  Historique des métriques à chaque retrain (accuracy, Brier, log-loss, CLV)
+  Détection automatique de dégradation du modèle entre saisons
+  UI légère sur le VPS
+
+### AD — PostgreSQL + Redis
+  SQLite → PostgreSQL pour concurrence (dashboard + predictor + result_checker)
+  Redis pour cache des cotes (TTL 5min) → évite appels API répétés

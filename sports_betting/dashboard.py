@@ -217,6 +217,11 @@ TEMPLATE = """
       <div class="kpi-value purple" id="kpi-brier">—</div>
       <div class="kpi-sub" id="kpi-sub-brier">calibration modèle</div>
     </div>
+    <div class="kpi-card">
+      <div class="kpi-label">📐 CLV Moyen</div>
+      <div class="kpi-value" id="kpi-clv" style="color:var(--muted)">—</div>
+      <div class="kpi-sub" id="kpi-sub-clv">closing line value</div>
+    </div>
   </div>
 
   <!-- Models status -->
@@ -453,7 +458,7 @@ let allPreds = [];
 })();
 
 async function loadData() {
-  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes] = await Promise.all([
+  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes, clvRes] = await Promise.all([
     fetch('/api/stats'),
     fetch('/api/predictions'),
     fetch('/api/roi_by_league'),
@@ -464,6 +469,7 @@ async function loadData() {
     fetch('/api/market_stats'),
     fetch('/api/brier_score'),
     fetch('/api/sharp_money'),
+    fetch('/api/clv'),
   ]);
 
   const stats     = await statsRes.json();
@@ -476,6 +482,7 @@ async function loadData() {
   const marketData= await marketRes.json();
   const brier     = await brierRes.json();
   const sharp     = await sharpRes.json();
+  const clv       = await clvRes.json();
   allPreds = preds;
 
   document.getElementById('updated').textContent = new Date().toLocaleTimeString('fr-FR');
@@ -503,6 +510,15 @@ async function loadData() {
     brierEl.style.color = brier.brier_score < 0.20 ? 'var(--green)' : brier.brier_score < 0.25 ? 'var(--gold)' : 'var(--red)';
   } else {
     brierEl.textContent = '—';
+  }
+
+  // CLV
+  const clvEl = document.getElementById('kpi-clv');
+  if (clv.avg_clv != null) {
+    clvEl.textContent = `${clv.avg_clv >= 0 ? '+' : ''}${clv.avg_clv.toFixed(2)}%`;
+    clvEl.style.color = clv.avg_clv > 0 ? 'var(--green)' : 'var(--red)';
+    document.getElementById('kpi-sub-clv').textContent =
+      `${clv.beat_rate}% > closing | ${clv.n_bets} paris`;
   }
 
   // ── Models status ───────────────────────────────────────────
@@ -1145,6 +1161,15 @@ def api_brier_score():
     )
     bs = total / len(rows)
     return jsonify({"brier_score": round(bs, 4), "n": len(rows)})
+
+
+@app.route("/api/clv")
+def api_clv():
+    """Closing Line Value moyen — standard de l'industrie pour mesurer l'edge réel."""
+    clv = tracker.get_avg_clv()
+    if not clv:
+        return jsonify({"avg_clv": None, "beat_rate": None, "n_bets": 0})
+    return jsonify(clv)
 
 
 @app.route("/api/sharp_money")

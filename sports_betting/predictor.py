@@ -233,7 +233,10 @@ def run_football_predictions():
                     if _should_alert(ah_sig):
                         send_prediction_alert(ah_sig, ah_stake)
 
-            # ── Signal Over/Under (marché indépendant) ────────
+            # ── Générer OU et BTTS (avant corrélation) — Z ───────
+            ou_sig   = None
+            btts_sig = None
+
             if ou_model.is_trained and daily_staked < daily_limit:
                 ou_odds_df  = league_ou_odds_map.get(fix["league"])
                 ou_odds_row = _match_ou_odds(ou_odds_df, fix["home_team"], fix["away_team"])
@@ -243,23 +246,7 @@ def run_football_predictions():
                     "away_team": fix["away_team"],
                     "date":      fix["date"],
                 })
-                if ou_sig:
-                    remaining_ou = daily_limit - daily_staked
-                    ou_stake = recommended_stake(ou_sig, bankroll)
-                    if ou_stake["stake_amount"] > remaining_ou:
-                        ou_stake["stake_amount"] = round(remaining_ou)
-                        ou_stake["stake_pct"] = round(remaining_ou / bankroll, 4) if bankroll > 0 else 0
-                    ou_sig["kelly_stake"]    = ou_stake["stake_amount"]
-                    ou_sig["stake_pct"]      = ou_stake["stake_pct"]
-                    ou_sig["expected_value"] = ou_stake.get("expected_value", 0)
-                    daily_staked += ou_stake["stake_amount"]
-                    signals.append(ou_sig)
-                    _log_signal(ou_sig, ou_stake)
-                    save_prediction(ou_sig)
-                    if _should_alert(ou_sig):
-                        send_prediction_alert(ou_sig, ou_stake)
 
-            # ── Signal BTTS (marché indépendant) — F ──────────
             if btts_model.is_trained and daily_staked < daily_limit:
                 btts_odds_df  = league_btts_odds_map.get(fix["league"])
                 btts_odds_row = _match_ou_odds(btts_odds_df, fix["home_team"], fix["away_team"]) \
@@ -270,21 +257,52 @@ def run_football_predictions():
                     "away_team": fix["away_team"],
                     "date":      fix["date"],
                 })
-                if btts_sig:
-                    remaining = daily_limit - daily_staked
-                    btts_stake = recommended_stake(btts_sig, bankroll)
-                    if btts_stake["stake_amount"] > remaining:
-                        btts_stake["stake_amount"] = round(remaining)
-                        btts_stake["stake_pct"] = round(remaining / bankroll, 4) if bankroll > 0 else 0
-                    btts_sig["kelly_stake"]    = btts_stake["stake_amount"]
-                    btts_sig["stake_pct"]      = btts_stake["stake_pct"]
-                    btts_sig["expected_value"] = btts_stake.get("expected_value", 0)
-                    daily_staked += btts_stake["stake_amount"]
-                    signals.append(btts_sig)
-                    _log_signal(btts_sig, btts_stake)
-                    save_prediction(btts_sig)
-                    if _should_alert(btts_sig):
-                        send_prediction_alert(btts_sig, btts_stake)
+
+            # ── Z — Corrélation entre marchés ────────────────────
+            if ou_sig and btts_sig:
+                ou_is_over  = ou_sig["pred_result"] == "O"
+                btts_is_yes = btts_sig["pred_result"] == "BTTS"
+                btts_is_no  = btts_sig["pred_result"] == "No BTTS"
+                if ou_is_over and btts_is_no:
+                    # Signaux contradictoires : Over 2.5 mais BTTS non → ignorer les deux
+                    logger.info(
+                        f"Corrélation OU/BTTS contradictoire — "
+                        f"{fix['home_team']} vs {fix['away_team']}: "
+                        f"Over 2.5 + No BTTS. Les deux signaux ignorés."
+                    )
+                    ou_sig   = None
+                    btts_sig = None
+                elif ou_is_over and btts_is_yes:
+                    # Signaux alignés : Over 2.5 + BTTS Yes → boost mise +20%
+                    logger.info(
+                        f"Corrélation OU/BTTS confirmée — "
+                        f"{fix['home_team']} vs {fix['away_team']}: "
+                        f"Over 2.5 + BTTS Yes. Mise +20%."
+                    )
+                    ou_sig["correlated_boost"]   = True
+                    btts_sig["correlated_boost"] = True
+
+            # ── Persister OU et BTTS ──────────────────────────────
+            for mkt_sig in (ou_sig, btts_sig):
+                if mkt_sig is None:
+                    continue
+                remaining_mkt = daily_limit - daily_staked
+                mkt_stake = recommended_stake(mkt_sig, bankroll)
+                if mkt_sig.get("correlated_boost"):
+                    mkt_stake["stake_amount"] = round(mkt_stake["stake_amount"] * 1.20)
+                    mkt_stake["stake_pct"]    = round(mkt_stake["stake_amount"] / bankroll, 4) if bankroll > 0 else 0
+                if mkt_stake["stake_amount"] > remaining_mkt:
+                    mkt_stake["stake_amount"] = round(remaining_mkt)
+                    mkt_stake["stake_pct"]    = round(remaining_mkt / bankroll, 4) if bankroll > 0 else 0
+                mkt_sig["kelly_stake"]    = mkt_stake["stake_amount"]
+                mkt_sig["stake_pct"]      = mkt_stake["stake_pct"]
+                mkt_sig["expected_value"] = mkt_stake.get("expected_value", 0)
+                daily_staked += mkt_stake["stake_amount"]
+                signals.append(mkt_sig)
+                _log_signal(mkt_sig, mkt_stake)
+                save_prediction(mkt_sig)
+                if _should_alert(mkt_sig):
+                    send_prediction_alert(mkt_sig, mkt_stake)
 
             time.sleep(0.2)
 
@@ -643,6 +661,23 @@ def run_all():
     if bankroll < LOW_BANKROLL_THRESHOLD:
         logger.warning(f"Bankroll critique: {bankroll:,.0f} FCFA < {LOW_BANKROLL_THRESHOLD:,.0f} FCFA")
         send_bankroll_alert(bankroll, LOW_BANKROLL_THRESHOLD)
+
+    # ── AA — Drawdown global : pause complète si > 20% depuis le pic ─
+    dd_exceeded, dd_pct = tracker.is_global_drawdown_exceeded(max_drawdown_pct=20.0)
+    if dd_exceeded:
+        peak = tracker.get_peak_bankroll()
+        logger.warning(
+            f"Drawdown global déclenché : {dd_pct:.1f}% depuis pic "
+            f"({peak:,.0f} FCFA → {bankroll:,.0f} FCFA). Aucune mise ce cycle."
+        )
+        send_message(
+            f"🛑 <b>BetMind — Drawdown global</b>\n\n"
+            f"Drawdown : <b>{dd_pct:.1f}%</b> depuis le pic ({peak:,.0f} FCFA)\n"
+            f"Bankroll actuelle : <b>{bankroll:,.0f} FCFA</b>\n\n"
+            f"⛔ Aucune nouvelle mise jusqu'à reprise du capital.\n"
+            f"🤖 BetMind Agent"
+        )
+        return []
 
     # Stop-loss journalier : P&L récent < -5% bankroll → aucune nouvelle mise
     stop_triggered, recent_pnl = _check_daily_stop_loss(bankroll)

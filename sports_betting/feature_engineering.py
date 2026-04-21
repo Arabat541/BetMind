@@ -8,7 +8,7 @@ import pandas as pd
 from data_fetcher import (
     fetch_team_stats, fetch_h2h, fetch_standings, get_team_standing,
     fetch_nba_team_stats, get_injury_stats, get_team_shots_stats,
-    fetch_match_weather,
+    fetch_match_weather, get_team_elo,
 )
 from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
 
@@ -148,6 +148,15 @@ def build_football_features(home_id: int, away_id: int,
     # ── Météo — J ────────────────────────────────────────────
     weather = fetch_match_weather(home_name)
     features["rainy_match"] = float(weather["rainy_match"])
+
+    # ── ELO dynamique — S ────────────────────────────────────
+    home_elo = get_team_elo(home_name)
+    away_elo = get_team_elo(away_name)
+    features.update({
+        "home_elo":  home_elo,
+        "away_elo":  away_elo,
+        "elo_diff":  round(home_elo - away_elo, 1),
+    })
 
     return features
 
@@ -303,6 +312,11 @@ def get_feature_columns(sport: str = "football") -> list:
             "home_title_gap",      "away_title_gap",
             # Météo — J
             "rainy_match",
+            # ELO dynamique — S
+            "home_elo", "away_elo", "elo_diff",
+            # Cotes de fermeture — AB
+            "impl_cl_home", "impl_cl_draw", "impl_cl_away",
+            "cl_move_home", "cl_move_draw", "cl_move_away",
         ]
     elif sport == "ou_football":
         return [

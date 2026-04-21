@@ -142,30 +142,40 @@ class BettingModel:
                 return self._predict_nba_prior(features)
 
     def _predict_xgb(self, features: dict) -> dict:
-        """Prédiction via XGBoost."""
+        """Prédiction via XGBoost (ou Ensemble avec variance — U)."""
         from feature_engineering import get_feature_columns
-        # Utilise les features du modèle entraîné (évite mismatch shape)
         cols = self.feature_cols if self.feature_cols else get_feature_columns(self.sport)
         X = pd.DataFrame([{c: features.get(c, 0.0) for c in cols}])
-        proba = self.model.predict_proba(X)[0]
+
+        # Variance ensemble — U
+        pred_variance = None
+        if ENSEMBLE_AVAILABLE and hasattr(self.model, "predict_proba_with_variance"):
+            try:
+                proba_arr, var_arr = self.model.predict_proba_with_variance(X)
+                proba = proba_arr[0]
+                pred_variance = round(float(var_arr[0]), 4)
+            except Exception:
+                proba = self.model.predict_proba(X)[0]
+        else:
+            proba = self.model.predict_proba(X)[0]
 
         if self.sport == "ou_football":
-            # Binaire : classes=[0=Under, 1=Over]
             return {
-                "prob_over":  round(float(proba[1]), 4),
-                "prob_under": round(float(proba[0]), 4),
-                "prob_home":  round(float(proba[1]), 4),   # alias pour compatibilité
-                "prob_draw":  0.0,
-                "prob_away":  round(float(proba[0]), 4),
-                "method":     "xgboost_ou"
+                "prob_over":      round(float(proba[1]), 4),
+                "prob_under":     round(float(proba[0]), 4),
+                "prob_home":      round(float(proba[1]), 4),
+                "prob_draw":      0.0,
+                "prob_away":      round(float(proba[0]), 4),
+                "pred_variance":  pred_variance,
+                "method":         "xgboost_ou"
             }
 
-        # XGBoost renvoie [H, D, A] si classes=[0,1,2]
         return {
-            "prob_home": round(float(proba[0]), 4),
-            "prob_draw": round(float(proba[1]), 4) if self.sport == "football" else 0.0,
-            "prob_away": round(float(proba[2 if self.sport == "football" else 1]), 4),
-            "method":    "xgboost"
+            "prob_home":     round(float(proba[0]), 4),
+            "prob_draw":     round(float(proba[1]), 4) if self.sport == "football" else 0.0,
+            "prob_away":     round(float(proba[2 if self.sport == "football" else 1]), 4),
+            "pred_variance": pred_variance,
+            "method":        "xgboost"
         }
 
     def _predict_poisson_prior(self, features: dict) -> dict:
@@ -218,6 +228,56 @@ class BettingModel:
 
 
 # ════════════════════════════════════════════════════════════
+# VIG REMOVAL — SHIN METHOD — T
+# ════════════════════════════════════════════════════════════
+
+def shin_probabilities(*odds: float) -> list[float]:
+    """
+    Méthode de Shin : supprime la marge bookmaker et corrige le biais
+    favori/outsider pour obtenir des probabilités "vraies".
+
+    Formule :
+        p_shin_i = (sqrt(z² + 4(1-z) · p_raw_i²) - z) / (2(1-z))
+    où z est résolu numériquement tel que sum(p_shin_i) = 1.
+
+    Args:
+        *odds : cotes décimales (ex: 1.85, 3.40, 4.20)
+    Returns:
+        liste de probas corrigées (sum = 1), même ordre que les cotes.
+    """
+    odds = [float(o) for o in odds if o and float(o) > 1.0]
+    if not odds:
+        n = len(odds) or 1
+        return [1.0 / n] * n
+
+    p_raw = [1.0 / o for o in odds]
+    vig   = sum(p_raw) - 1.0
+
+    if vig <= 0:
+        # Déjà sans marge — normalisation simple
+        s = sum(p_raw)
+        return [p / s for p in p_raw]
+
+    # Résolution numérique de z via dichotomie (converge en ~30 itérations)
+    lo, hi = 0.0, 0.5
+    for _ in range(60):
+        z   = (lo + hi) / 2.0
+        ps  = [(np.sqrt(z**2 + 4.0 * (1.0 - z) * p**2) - z) / (2.0 * (1.0 - z))
+               for p in p_raw]
+        s   = sum(ps)
+        if abs(s - 1.0) < 1e-10:
+            break
+        if s > 1.0:
+            lo = z
+        else:
+            hi = z
+
+    # Renormalise pour garantir sum = 1 (erreurs numériques)
+    s = sum(ps)
+    return [round(p / s, 6) for p in ps]
+
+
+# ════════════════════════════════════════════════════════════
 # VALUE BET DETECTOR
 # ════════════════════════════════════════════════════════════
 
@@ -235,13 +295,29 @@ def detect_value_bets(proba: dict, odds_row: dict, sport: str = "football") -> l
     """
     value_bets = []
 
+    odd_h = odds_row.get("odd_home")
+    odd_d = odds_row.get("odd_draw")
+    odd_a = odds_row.get("odd_away")
+
+    # Shin method : supprime le vig pour avoir de vraies probas implicites — T
+    if odd_h and odd_a:
+        if sport == "football" and odd_d:
+            shin_h, shin_d, shin_a = shin_probabilities(odd_h, odd_d, odd_a)
+        else:
+            shin_h, shin_a = shin_probabilities(odd_h, odd_a)
+            shin_d = 0.0
+    else:
+        shin_h = odds_row.get("impl_home", 0.33)
+        shin_d = odds_row.get("impl_draw", 0.33)
+        shin_a = odds_row.get("impl_away", 0.33)
+
     candidates = [
-        ("H", proba.get("prob_home", 0), odds_row.get("impl_home", 0), odds_row.get("odd_home")),
-        ("A", proba.get("prob_away", 0), odds_row.get("impl_away", 0), odds_row.get("odd_away")),
+        ("H", proba.get("prob_home", 0), shin_h, odd_h),
+        ("A", proba.get("prob_away", 0), shin_a, odd_a),
     ]
     if sport == "football":
         candidates.append(
-            ("D", proba.get("prob_draw", 0), odds_row.get("impl_draw", 0), odds_row.get("odd_draw"))
+            ("D", proba.get("prob_draw", 0), shin_d, odd_d)
         )
 
     _EDGE_MIN = {"H": VALUE_BET_EDGE_HOME, "A": VALUE_BET_EDGE_AWAY, "D": VALUE_BET_EDGE_DRAW}
@@ -615,13 +691,20 @@ def build_prediction_signal(
         odd_d = odds_row.get("odd_draw")
         odd_a = odds_row.get("odd_away")
         enriched.update({
-            "impl_home":  odds_row.get("impl_home", 0.33),
-            "impl_draw":  odds_row.get("impl_draw", 0.33),
-            "impl_away":  odds_row.get("impl_away", 0.33),
-            "odd_home":   odd_h or 2.5,
-            "odd_draw":   odd_d or 3.3,
-            "odd_away":   odd_a or 2.5,
-            "has_odds":   1.0 if (odd_h and odd_d and odd_a) else 0.0,
+            "impl_home":    odds_row.get("impl_home", 0.33),
+            "impl_draw":    odds_row.get("impl_draw", 0.33),
+            "impl_away":    odds_row.get("impl_away", 0.33),
+            "odd_home":     odd_h or 2.5,
+            "odd_draw":     odd_d or 3.3,
+            "odd_away":     odd_a or 2.5,
+            "has_odds":     1.0 if (odd_h and odd_d and odd_a) else 0.0,
+            # Closing odds proxy (AB) — à l'inférence, cotes actuelles = proxy fermeture
+            "impl_cl_home": odds_row.get("impl_home", 0.33),
+            "impl_cl_draw": odds_row.get("impl_draw", 0.33),
+            "impl_cl_away": odds_row.get("impl_away", 0.33),
+            "cl_move_home": 0.0,
+            "cl_move_draw": 0.0,
+            "cl_move_away": 0.0,
         })
 
     proba = model.predict_proba(enriched)
@@ -651,13 +734,26 @@ def build_prediction_signal(
         "prob_home":   proba["prob_home"],
         "prob_draw":   proba.get("prob_draw", 0),
         "prob_away":   proba["prob_away"],
-        "confidence":  round(confidence, 4),
-        "method":      proba.get("method", ""),
-        "value_bets":  value_bets,
-        "is_value_bet": len(value_bets) > 0,
-        "edge":        value_bets[0]["edge"] if value_bets else 0.0,
-        "top_odd":     value_bets[0]["odd"]  if value_bets else None,
-        "odd_used":    value_bets[0]["odd"]  if value_bets else None,
+        "confidence":     round(confidence, 4),
+        "method":         proba.get("method", ""),
+        "value_bets":     value_bets,
+        "is_value_bet":   len(value_bets) > 0,
+        "edge":           value_bets[0]["edge"] if value_bets else 0.0,
+        "top_odd":        value_bets[0]["odd"]  if value_bets else None,
+        "odd_used":       value_bets[0]["odd"]  if value_bets else None,
+        # Variance ensemble — U : std max entre XGB et LGB (None si pas d'ensemble)
+        "pred_variance":  proba.get("pred_variance"),
     }
+
+    # Filtre variance — U : si désaccord fort entre base-learners, retire le signal value
+    variance = proba.get("pred_variance")
+    if variance is not None and variance > 0.08 and signal["is_value_bet"]:
+        logger.info(
+            f"  [Variance filter] Désaccord XGB/LGB trop élevé "
+            f"(std={variance:.3f} > 0.08) — value bet retiré."
+        )
+        signal["value_bets"]  = []
+        signal["is_value_bet"] = False
+        signal["edge"]         = 0.0
 
     return signal

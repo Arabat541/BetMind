@@ -508,6 +508,33 @@ class BankrollTracker:
 
         return False, ""
 
+    def get_peak_bankroll(self) -> float:
+        """Retourne le solde maximum jamais atteint (pic historique)."""
+        conn = sqlite3.connect(DB_PATH)
+        row  = conn.execute("SELECT MAX(balance) FROM bankroll").fetchone()
+        conn.close()
+        return float(row[0]) if row and row[0] is not None else INITIAL_BANKROLL
+
+    def get_drawdown_pct(self) -> float:
+        """
+        Drawdown actuel en % par rapport au pic historique.
+        Retourne 0 si on est au-dessus ou égal au pic.
+        """
+        peak    = self.get_peak_bankroll()
+        current = self.get_balance()
+        if peak <= 0:
+            return 0.0
+        dd = (peak - current) / peak * 100
+        return round(max(dd, 0.0), 2)
+
+    def is_global_drawdown_exceeded(self, max_drawdown_pct: float = 20.0) -> tuple[bool, float]:
+        """
+        Vérifie si le drawdown global dépasse le seuil autorisé.
+        Retourne (exceeded: bool, current_drawdown_pct: float).
+        """
+        dd = self.get_drawdown_pct()
+        return dd >= max_drawdown_pct, dd
+
     def performance_summary(self) -> pd.DataFrame:
         """Résumé de performance par sport/ligue."""
         df = self._get_settled_bets()
