@@ -66,3 +66,90 @@
 ### AH — PostgreSQL + Redis
   SQLite → PostgreSQL pour concurrence (dashboard + predictor + result_checker)
   Redis pour cache des cotes (TTL 5min) → évite appels API répétés
+
+
+## ✅ Toutes les features A→AH complétées — 2026-04-21
+
+Push GitHub : Arabat541/BetMind — branche main
+VPS déployé : 46.224.165.35 (19 fichiers via deploy.sh)
+Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
+
+
+## 🔴 Priorité 1 — Impact élevé modèle
+
+### AI — Dixon-Coles correction
+  Corrige le modèle de Poisson pour les scores faibles (0-0, 1-0, 0-1)
+  systématiquement sous-estimés — standard dans l'industrie
+  Paramètre ρ (rho) calibré sur données historiques
+  Attendu : +1-2% accuracy sur marchés buts
+
+### AJ — LSTM / séquences temporelles
+  RNN sur les 10 derniers matchs de chaque équipe
+  Capture les tendances de forme mieux que les moyennes glissantes
+  Feature engineered depuis les séquences W/D/L + buts + xG
+  Attendu : +2-3% accuracy
+
+### AK — Player-level xG (impact blessures précis)
+  Calculer la contribution xG de chaque joueur absent
+  Remplace le comptage brut blessures par l'impact réel sur les xG équipe
+  Source : Understat player stats
+  Attendu : +1% accuracy
+
+### AL — Modèle Correct Score (Poisson bivarié)
+  Probabilités exactes pour chaque score (1-0, 2-1, 0-0…)
+  Marché très mal calibré par les bookmakers → edge important
+  Génère des alertes sur les scores value (cote > 1/probabilité)
+
+
+## 🟠 Priorité 2 — Données supplémentaires
+
+### AM — Reverse Line Movement
+  Cote monte alors que le public mise dans l'autre sens
+  Signal sharp très fort — les bookmakers suivent l'argent, pas les tickets
+  Croisement avec ticket % vs money % (source : The Odds API)
+
+### AN — Fixture congestion précise
+  Nombre de matchs sur 21 jours + probabilité de rotation
+  Plus précis que la fatigue actuelle (basée sur les jours uniquement)
+  Intégrer les compétitions européennes (Champions League, Europa)
+
+### AO — Distance déplacement Away
+  Kilomètres parcourus + décalage horaire pour les matchs européens
+  Home advantage ajusté selon capacité du stade (stade plein vs vide)
+  Source : géocodage des stades + données affluence
+
+### AP — Sentiment NLP (rumeurs blessures)
+  Scraping Twitter / Sky Sports / L'Équipe avant publication officielle
+  Détection de mots-clés : "doubtful", "injury", "out", "ruled out"
+  TTL court (1h) — signal très temporel
+
+
+## 🟡 Priorité 3 — Stratégie & marchés
+
+### AQ — Marché Both Halves Goals
+  Les deux équipes marquent dans chaque mi-temps
+  Marché peu modélisé → edge potentiellement élevé
+  Extension naturelle du modèle BTTS existant
+
+### AR — Dutching multi-outcomes
+  Répartir la mise sur plusieurs outcomes pour profit garanti
+  Calcul automatique des mises quand somme des probabilités > 1
+  Intégration dans predictor.py après détection d'opportunité
+
+### AS — Line shopping multi-bookmakers
+  Comparer 5+ bookmakers via The Odds API pour prendre la meilleure cote
+  Sauvegarder best_odd_available vs odd_used dans DB
+  Impact direct sur le ROI sans changer le modèle
+
+
+## 🟢 Priorité 4 — Infrastructure sharp
+
+### AT — Steam move detector
+  Variation de cote > 5% en < 3 minutes sur plusieurs books = sharp money
+  WebSocket vers The Odds API (latence < 1s) remplace le polling actuel
+  Alerte Telegram immédiate + flag dans la prédiction concernée
+
+### AU — Account health scoring
+  Détecter si un compte bookmaker est en cours de limitation
+  Métriques : délai de confirmation, plafond de mise accepté, oddss refusés
+  Alerte automatique + rotation vers un autre compte
