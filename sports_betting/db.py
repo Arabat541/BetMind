@@ -47,16 +47,57 @@ def _sqlite_path() -> str:
     return DB_PATH
 
 
+class _PgConnWrapper:
+    """
+    Wrapper psycopg2 qui expose conn.execute() comme sqlite3.
+    psycopg2 n'a pas de .execute() sur la connexion directement —
+    on délègue à un curseur interne pour une API uniforme.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur  = conn.cursor()
+
+    def execute(self, sql, params=None):
+        if params is not None:
+            self._cur.execute(sql, params)
+        else:
+            self._cur.execute(sql)
+        return self._cur
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        self._conn.close()
+
+
 @contextmanager
 def get_conn():
     """
     Context manager qui fournit une connexion DB.
     Commit automatique si pas d'exception, rollback sinon.
-    Compatible sqlite3 et psycopg2.
+    Compatible sqlite3 et psycopg2 — conn.execute() fonctionne dans les deux cas.
     """
     if _USE_PG and _PSYCOPG2_OK:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = False
+        raw = psycopg2.connect(DATABASE_URL)
+        raw.autocommit = False
+        conn = _PgConnWrapper(raw)
         try:
             yield conn
             conn.commit()
