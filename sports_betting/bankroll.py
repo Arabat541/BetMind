@@ -9,6 +9,7 @@ from datetime import datetime
 from config import (
     KELLY_FRACTION, KELLY_FRACTION_DRAW, MAX_BET_PCT, INITIAL_BANKROLL, DB_PATH
 )
+from db import get_conn, raw_conn, ph as _ph
 
 logger = logging.getLogger(__name__)
 
@@ -119,39 +120,33 @@ class BankrollTracker:
         self._ensure_initial_balance()
 
     def _ensure_initial_balance(self):
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM bankroll")
-        if c.fetchone()[0] == 0:
-            c.execute("""
-                INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
-                VALUES (?, 0, 0, 0, 0.0)
-            """, (INITIAL_BANKROLL,))
-            conn.commit()
-            logger.info(f"Bankroll initialisée à {INITIAL_BANKROLL:,.0f} FCFA")
-        conn.close()
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM bankroll")
+            if c.fetchone()[0] == 0:
+                c.execute(f"""
+                    INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
+                    VALUES ({_ph}, 0, 0, 0, 0.0)
+                """, (INITIAL_BANKROLL,))
+                logger.info(f"Bankroll initialisée à {INITIAL_BANKROLL:,.0f} FCFA")
 
     def get_balance(self) -> float:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1")
-        row = c.fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1").fetchone()
         return row[0] if row else INITIAL_BANKROLL
 
     def get_today_staked(self) -> float:
         """Retourne la somme des mises déjà enregistrées aujourd'hui (en FCFA)."""
         today = datetime.now().strftime("%Y-%m-%d")
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute(
-            "SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions WHERE DATE(created_at) = ?",
-            (today,)
-        ).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute(
+                f"SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions WHERE DATE(created_at) = {_ph}",
+                (today,)
+            ).fetchone()
         return float(row[0]) if row else 0.0
 
     def get_stats(self) -> dict:
-        conn = sqlite3.connect(DB_PATH)
+        conn = raw_conn()
         c = conn.cursor()
         c.execute("SELECT * FROM bankroll ORDER BY id DESC LIMIT 1")
         row = c.fetchone()
@@ -177,19 +172,18 @@ class BankrollTracker:
     def get_today_stats(self) -> dict:
         """Stats des paris d'aujourd'hui uniquement."""
         today = datetime.now().strftime("%Y-%m-%d")
-        conn  = sqlite3.connect(DB_PATH)
-        row   = conn.execute("""
-            SELECT
-                COUNT(*)                                                  AS bets,
-                SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END)      AS settled,
-                SUM(CASE WHEN pnl > 0             THEN 1 ELSE 0 END)      AS wins,
-                SUM(CASE WHEN pnl < 0             THEN 1 ELSE 0 END)      AS losses,
-                COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN pnl        ELSE 0 END), 0) AS pnl,
-                COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN kelly_stake ELSE 0 END), 0) AS staked
-            FROM predictions
-            WHERE DATE(created_at) = ?
-        """, (today,)).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute(f"""
+                SELECT
+                    COUNT(*)                                                  AS bets,
+                    SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END)      AS settled,
+                    SUM(CASE WHEN pnl > 0             THEN 1 ELSE 0 END)      AS wins,
+                    SUM(CASE WHEN pnl < 0             THEN 1 ELSE 0 END)      AS losses,
+                    COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN pnl        ELSE 0 END), 0) AS pnl,
+                    COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN kelly_stake ELSE 0 END), 0) AS staked
+                FROM predictions
+                WHERE DATE(created_at) = {_ph}
+            """, (today,)).fetchone()
         bets, settled, wins, losses, pnl, staked = row or (0, 0, 0, 0, 0, 0)
         settled  = int(settled  or 0)
         staked   = float(staked or 0)
@@ -211,48 +205,41 @@ class BankrollTracker:
         outcome : "H", "D" ou "A"
         Opération atomique : rollback complet si une étape échoue.
         """
-        conn = sqlite3.connect(DB_PATH)
-        c    = conn.cursor()
         try:
-            c.execute("SELECT pred_result, kelly_stake, odd_used FROM predictions WHERE id=?",
-                      (prediction_id,))
-            row = c.fetchone()
-            if not row:
-                return
+            with get_conn() as conn:
+                c = conn.cursor()
+                c.execute(f"SELECT pred_result, kelly_stake, odd_used FROM predictions WHERE id={_ph}",
+                          (prediction_id,))
+                row = c.fetchone()
+                if not row:
+                    return
 
-            pred_result, stake, odd = row
-            won = (pred_result == outcome)
-            pnl = round(stake * (odd - 1), 0) if won else -stake
+                pred_result, stake, odd = row[0], row[1], row[2]
+                won = (pred_result == outcome)
+                pnl = round(stake * (odd - 1), 0) if won else -stake
 
-            c.execute("UPDATE predictions SET outcome=?, pnl=? WHERE id=?",
-                      (outcome, pnl, prediction_id))
+                c.execute(f"UPDATE predictions SET outcome={_ph}, pnl={_ph} WHERE id={_ph}",
+                          (outcome, pnl, prediction_id))
 
-            # Mise à jour balance
-            c.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1")
-            balance = c.fetchone()[0]
-            new_balance = balance + pnl
+                c.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1")
+                balance = c.fetchone()[0]
+                new_balance = balance + pnl
 
-            c.execute("""
-                INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
-                SELECT ?, total_bets+1, wins+?, losses+?, 0
-                FROM bankroll ORDER BY id DESC LIMIT 1
-            """, (new_balance, 1 if won else 0, 0 if won else 1))
+                c.execute(f"""
+                    INSERT INTO bankroll (balance, total_bets, wins, losses, roi)
+                    SELECT {_ph}, total_bets+1, wins+{_ph}, losses+{_ph}, 0
+                    FROM bankroll ORDER BY id DESC LIMIT 1
+                """, (new_balance, 1 if won else 0, 0 if won else 1))
 
-            conn.commit()
             logger.info(f"Bet settled #{prediction_id}: {'WIN' if won else 'LOSS'} | PnL: {pnl:+,.0f} FCFA")
 
         except Exception as e:
-            conn.rollback()
             logger.error(f"settle_bet rollback #{prediction_id}: {e}")
             raise
-        finally:
-            conn.close()
 
     def _get_settled_bets(self) -> pd.DataFrame:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(
-            "SELECT * FROM predictions WHERE outcome IS NOT NULL", conn
-        )
+        conn = raw_conn()
+        df = pd.read_sql_query("SELECT * FROM predictions WHERE outcome IS NOT NULL", conn)
         conn.close()
         return df
 
@@ -262,24 +249,23 @@ class BankrollTracker:
         Tranches : <55%, 55-65%, >65%.
         Utilisé pour vérifier la calibration du modèle.
         """
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""
-            SELECT
-                CASE
-                    WHEN confidence < 0.55 THEN '<55%'
-                    WHEN confidence < 0.65 THEN '55-65%'
-                    ELSE '>65%'
-                END AS tier,
-                COUNT(*)                                    AS bets,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
-                COALESCE(SUM(pnl), 0)                       AS pnl,
-                COALESCE(SUM(kelly_stake), 0)               AS staked
-            FROM predictions
-            WHERE outcome IS NOT NULL AND kelly_stake > 0
-            GROUP BY tier
-            ORDER BY MIN(confidence)
-        """).fetchall()
-        conn.close()
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    CASE
+                        WHEN confidence < 0.55 THEN '<55%'
+                        WHEN confidence < 0.65 THEN '55-65%'
+                        ELSE '>65%'
+                    END AS tier,
+                    COUNT(*)                                    AS bets,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
+                    COALESCE(SUM(pnl), 0)                       AS pnl,
+                    COALESCE(SUM(kelly_stake), 0)               AS staked
+                FROM predictions
+                WHERE outcome IS NOT NULL AND kelly_stake > 0
+                GROUP BY tier
+                ORDER BY MIN(confidence)
+            """).fetchall()
 
         result = []
         for tier, bets, wins, pnl, staked in rows:
@@ -301,20 +287,19 @@ class BankrollTracker:
         Mesure la calibration du modèle en production (pas seulement à l'entraînement).
         Références : <0.20 excellent | 0.20-0.25 correct | >0.25 pire que naïf (50/50).
         """
-        conn = sqlite3.connect(DB_PATH)
-        row  = conn.execute("""
-            SELECT
-                COUNT(*) AS n,
-                AVG(
-                    (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
-                    (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
-                ) AS brier_score
-            FROM predictions
-            WHERE outcome IS NOT NULL
-              AND kelly_stake > 0
-              AND confidence IS NOT NULL
-        """).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS n,
+                    AVG(
+                        (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
+                        (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
+                    ) AS brier_score
+                FROM predictions
+                WHERE outcome IS NOT NULL
+                  AND kelly_stake > 0
+                  AND confidence IS NOT NULL
+            """).fetchone()
 
         n, score = row
         if not n or score is None:
@@ -328,17 +313,16 @@ class BankrollTracker:
         CLV > 0 = on a obtenu une meilleure cote que la fermeture → edge réel confirmé.
         CLV < 0 = le marché avait raison contre nous → à surveiller.
         """
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""
-            SELECT odd_used, odd_closing
-            FROM predictions
-            WHERE outcome IS NOT NULL
-              AND kelly_stake > 0
-              AND odd_used    > 0
-              AND odd_closing IS NOT NULL
-              AND odd_closing > 0
-        """).fetchall()
-        conn.close()
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT odd_used, odd_closing
+                FROM predictions
+                WHERE outcome IS NOT NULL
+                  AND kelly_stake > 0
+                  AND odd_used    > 0
+                  AND odd_closing IS NOT NULL
+                  AND odd_closing > 0
+            """).fetchall()
 
         if not rows:
             return {}
@@ -355,18 +339,17 @@ class BankrollTracker:
         P&L total des paris réglés sur les N derniers jours de matchs.
         Utilisé par le stop-loss journalier.
         """
-        conn = sqlite3.connect(DB_PATH)
-        row  = conn.execute("""
-            SELECT COALESCE(SUM(pnl), 0) FROM predictions
-            WHERE outcome IS NOT NULL
-              AND DATE(match_date) >= date('now', ?)
-        """, (f"-{days} days",)).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute(f"""
+                SELECT COALESCE(SUM(pnl), 0) FROM predictions
+                WHERE outcome IS NOT NULL
+                  AND DATE(match_date) >= date('now', {_ph})
+            """, (f"-{days} days",)).fetchone()
         return float(row[0]) if row else 0.0
 
     def get_weekly_stats(self) -> dict:
         """Stats des paris réglés sur les 7 derniers jours."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = raw_conn()
         df   = pd.read_sql_query("""
             SELECT * FROM predictions
             WHERE outcome IS NOT NULL
@@ -438,17 +421,16 @@ class BankrollTracker:
         Stats des N derniers paris réglés pour une ligue donnée.
         Retourne : bets, wins, losses, pnl, roi, consecutive_losses
         """
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""
-            SELECT pnl, kelly_stake
-            FROM predictions
-            WHERE outcome IS NOT NULL
-              AND kelly_stake > 0
-              AND league = ?
-            ORDER BY match_date DESC
-            LIMIT ?
-        """, (league, n_recent)).fetchall()
-        conn.close()
+        with get_conn() as conn:
+            rows = conn.execute(f"""
+                SELECT pnl, kelly_stake
+                FROM predictions
+                WHERE outcome IS NOT NULL
+                  AND kelly_stake > 0
+                  AND league = {_ph}
+                ORDER BY match_date DESC
+                LIMIT {_ph}
+            """, (league, n_recent)).fetchall()
 
         if not rows:
             return {"bets": 0, "wins": 0, "losses": 0, "pnl": 0.0, "roi": 0.0, "consecutive_losses": 0}
@@ -510,9 +492,8 @@ class BankrollTracker:
 
     def get_peak_bankroll(self) -> float:
         """Retourne le solde maximum jamais atteint (pic historique)."""
-        conn = sqlite3.connect(DB_PATH)
-        row  = conn.execute("SELECT MAX(balance) FROM bankroll").fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute("SELECT MAX(balance) FROM bankroll").fetchone()
         return float(row[0]) if row and row[0] is not None else INITIAL_BANKROLL
 
     def get_drawdown_pct(self) -> float:

@@ -330,6 +330,24 @@ TEMPLATE = """
     </div>
   </div>
 
+  <!-- AG — Model History -->
+  <div class="table-card" id="model-history-section" style="margin-bottom:16px;">
+    <div class="table-header">
+      <span class="table-title">📈 Historique retrains</span>
+      <span style="color:var(--muted);font-size:12px;font-family:'JetBrains Mono'" id="mh-status"></span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Modèle</th><th>Date</th><th>Accuracy</th><th>ΔAcc</th><th>Log Loss</th><th>Samples</th>
+          </tr>
+        </thead>
+        <tbody id="model-history-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- ROI par ligue — Table -->
   <div class="table-card" id="roi-section" style="margin-bottom:16px;">
     <div class="table-header">
@@ -491,7 +509,7 @@ let allPreds = [];
 })();
 
 async function loadData() {
-  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes, clvRes, xgSqRes] = await Promise.all([
+  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes, clvRes, xgSqRes, mhRes] = await Promise.all([
     fetch('/api/stats'),
     fetch('/api/predictions'),
     fetch('/api/roi_by_league'),
@@ -504,6 +522,7 @@ async function loadData() {
     fetch('/api/sharp_money'),
     fetch('/api/clv'),
     fetch('/api/xg_squad'),
+    fetch('/api/model_history'),
   ]);
 
   const stats     = await statsRes.json();
@@ -518,6 +537,7 @@ async function loadData() {
   const sharp     = await sharpRes.json();
   const clv       = await clvRes.json();
   const xgSq      = await xgSqRes.json();
+  const mhData    = await mhRes.json();
   allPreds = preds;
 
   document.getElementById('updated').textContent = new Date().toLocaleTimeString('fr-FR');
@@ -596,6 +616,7 @@ async function loadData() {
   buildLeagueChart(roiData);
   buildMarketTable(marketData);
   buildXgSquadWidget(xgSq);
+  buildModelHistory(mhData);
 }
 
 function buildXgSquadWidget(data) {
@@ -628,6 +649,57 @@ function buildXgSquadWidget(data) {
       <td style="padding:3px 6px;text-align:right;font-family:'JetBrains Mono';color:${barColor}">${r.value_m >= 1000 ? (r.value_m/1000).toFixed(2)+'bn' : r.value_m.toFixed(0)+'M'}</td>
     </tr>`;
   }).join('');
+}
+
+function buildModelHistory(data) {
+  const tbody = document.getElementById('model-history-tbody');
+  const status = document.getElementById('mh-status');
+  if (!tbody) return;
+
+  const MODEL_LABELS = {
+    football_1x2: '⚽ 1X2', over_under: '📊 O/U 2.5', btts: '🎯 BTTS'
+  };
+
+  // Flatten toutes les entrées, triées par date desc
+  const rows = [];
+  for (const [model, runs] of Object.entries(data)) {
+    runs.forEach((r, i) => {
+      const prev = i > 0 ? runs[i-1].accuracy : null;
+      rows.push({ model, ...r, prev_acc: prev });
+    });
+  }
+  rows.sort((a, b) => b.ts.localeCompare(a.ts));
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:12px">Aucun retrain enregistré</td></tr>';
+    status.textContent = 'Pas encore de données';
+    return;
+  }
+
+  // Badge dégradation
+  let degraded = 0;
+  tbody.innerHTML = rows.slice(0, 30).map(r => {
+    const delta = r.prev_acc != null ? r.accuracy - r.prev_acc : null;
+    const deltaStr = delta != null
+      ? `<span style="color:${delta >= 0 ? 'var(--green)' : 'var(--red)'}">${delta >= 0 ? '+' : ''}${(delta*100).toFixed(1)}%</span>`
+      : '<span style="color:var(--muted)">—</span>';
+    if (delta != null && delta < -0.02) degraded++;
+    const accColor = r.accuracy >= 0.54 ? 'var(--green)' : r.accuracy >= 0.52 ? 'var(--gold)' : 'var(--red)';
+    const date = r.ts ? r.ts.replace('T', ' ').slice(0, 16) : '—';
+    return `<tr>
+      <td style="font-family:'JetBrains Mono';font-size:12px">${MODEL_LABELS[r.model] || r.model}</td>
+      <td style="color:var(--muted);font-size:11px;font-family:'JetBrains Mono'">${date}</td>
+      <td style="color:${accColor};font-family:'JetBrains Mono'">${(r.accuracy*100).toFixed(1)}%</td>
+      <td>${deltaStr}</td>
+      <td style="font-family:'JetBrains Mono';color:var(--muted)">${r.log_loss != null ? r.log_loss.toFixed(4) : '—'}</td>
+      <td style="font-family:'JetBrains Mono';color:var(--muted)">${r.n_samples != null ? r.n_samples.toLocaleString('fr-FR') : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  status.textContent = degraded > 0
+    ? `⚠ ${degraded} dégradation(s) détectée(s)`
+    : `${rows.length} run(s) — stable`;
+  status.style.color = degraded > 0 ? 'var(--red)' : 'var(--green)';
 }
 
 function buildExposureBar(data) {
@@ -1353,6 +1425,15 @@ def api_run():
     from predictor import run_all
     signals = run_all()
     return jsonify({"status": "ok", "signals": len(signals)})
+
+
+@app.route("/api/model_history")
+def api_model_history():
+    try:
+        from model_registry import get_all_history
+        return jsonify(get_all_history())
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 @app.route("/api/xg_squad")

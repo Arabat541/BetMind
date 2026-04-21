@@ -1171,8 +1171,22 @@ def train():
     # 9. Shots lookup pour prédictions live
     save_team_shots_lookup(all_df)
 
-    final_acc = np.mean(fold_accs)
+    final_acc = float(np.mean(fold_accs))
+    final_ll  = float(np.mean(fold_lls))
     logger.info(f"Accuracy walk-forward : {final_acc:.1%}")
+
+    # AG — MLflow / model registry
+    try:
+        from model_registry import log_run
+        log_run("football_1x2", {
+            "accuracy":  final_acc,
+            "log_loss":  final_ll,
+            "n_samples": len(X),
+            "n_features": len(FEATURE_COLS),
+        }, params=xgb_params)
+    except Exception as e:
+        logger.warning(f"model_registry log failed: {e}")
+
     return final_acc
 
 

@@ -162,16 +162,25 @@ def _fd_get(endpoint: str, params: dict = {}) -> dict:
         return {}
 
 
-def _odds_get(endpoint: str, params: dict) -> dict:
-    """Wrapper pour The Odds API."""
-    params["apiKey"] = THE_ODDS_API_KEY
-    url = f"{ODDS_API_BASE}/{endpoint}"
-    try:
-        r = _http_get_with_retry(url, params=params)
-        return r.json()
-    except Exception as e:
-        logger.error(f"Odds API error [{endpoint}]: {e}")
-        return {}
+def _odds_get(endpoint: str, params: dict, ttl: int = 300) -> dict:
+    """Wrapper pour The Odds API avec cache Redis (TTL 5 min par défaut)."""
+    from cache import cached_get
+    # Clé de cache : endpoint + params sérialisés (sans apiKey)
+    cache_params = {k: v for k, v in params.items() if k != "apiKey"}
+    cache_key = f"odds:{endpoint}:{sorted(cache_params.items())}"
+
+    def _fetch():
+        p = dict(params)
+        p["apiKey"] = THE_ODDS_API_KEY
+        url = f"{ODDS_API_BASE}/{endpoint}"
+        try:
+            r = _http_get_with_retry(url, params=p)
+            return r.json()
+        except Exception as e:
+            logger.error(f"Odds API error [{endpoint}]: {e}")
+            return {}
+
+    return cached_get(cache_key, _fetch, ttl=ttl)
 
 
 def _balldontlie_get(endpoint: str, params: dict = {}) -> dict:
@@ -760,12 +769,13 @@ def get_injury_stats(injuries_dict: dict, team_name: str) -> dict:
 
 
 def init_db():
-    """Initialise la base de données SQLite."""
+    """Initialise la base de données (SQLite ou PostgreSQL via db.py)."""
     import os
+    from db import get_conn, adapt_ddl, is_postgres, ph
     os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+    with get_conn() as conn:
+      c = conn.cursor()
+      c.execute(adapt_ddl("""
         CREATE TABLE IF NOT EXISTS predictions (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at   TEXT    DEFAULT (datetime('now')),
@@ -780,64 +790,59 @@ def init_db():
             method       TEXT DEFAULT NULL,
             odd_closing  REAL DEFAULT NULL
         )
-    """)
-    # Migration : ajouter les colonnes si la table existe déjà sans elles
-    _migrations = [
-        ("home_injuries_out",    "REAL DEFAULT 0"),
-        ("home_injuries_dtd",    "REAL DEFAULT 0"),
-        ("away_injuries_out",    "REAL DEFAULT 0"),
-        ("away_injuries_dtd",    "REAL DEFAULT 0"),
-        ("method",               "TEXT DEFAULT NULL"),
-        ("odd_closing",          "REAL DEFAULT NULL"),
-        ("odd_opening",          "REAL DEFAULT NULL"),
-        ("opening_movement_pct", "REAL DEFAULT NULL"),
-        ("market",               "TEXT DEFAULT NULL"),
-    ]
-    for col, col_type in _migrations:
-        try:
-            c.execute(f"ALTER TABLE predictions ADD COLUMN {col} {col_type}")
-        except Exception:
-            pass  # colonne déjà présente
-    c.execute("""
+      """))
+      # Migrations : ajouter colonnes manquantes
+      _migrations = [
+          ("home_injuries_out",    "REAL DEFAULT 0"),
+          ("home_injuries_dtd",    "REAL DEFAULT 0"),
+          ("away_injuries_out",    "REAL DEFAULT 0"),
+          ("away_injuries_dtd",    "REAL DEFAULT 0"),
+          ("method",               "TEXT DEFAULT NULL"),
+          ("odd_closing",          "REAL DEFAULT NULL"),
+          ("odd_opening",          "REAL DEFAULT NULL"),
+          ("opening_movement_pct", "REAL DEFAULT NULL"),
+          ("market",               "TEXT DEFAULT NULL"),
+      ]
+      for col, col_type in _migrations:
+          try:
+              c.execute(f"ALTER TABLE predictions ADD COLUMN {col} {col_type}")
+          except Exception:
+              pass  # colonne déjà présente
+      c.execute(adapt_ddl("""
         CREATE TABLE IF NOT EXISTS bankroll (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             updated_at TEXT DEFAULT (datetime('now')),
             balance    REAL, total_bets INTEGER, wins INTEGER, losses INTEGER, roi REAL
         )
-    """)
-    conn.commit()
-    conn.close()
+      """))
     logger.info("Database initialized.")
 
 
 def save_prediction(pred: dict):
-    conn = sqlite3.connect(DB_PATH)
+    from db import get_conn, ph
     try:
-        conn.execute("""
-            INSERT INTO predictions
-            (sport,league,home_team,away_team,match_date,pred_result,
-             prob_home,prob_draw,prob_away,confidence,is_value_bet,edge,kelly_stake,odd_used,
-             home_injuries_out,home_injuries_dtd,away_injuries_out,away_injuries_dtd,
-             method,odd_opening,market)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            pred.get("sport"), pred.get("league"), pred.get("home_team"), pred.get("away_team"),
-            pred.get("match_date"), pred.get("pred_result"), pred.get("prob_home"),
-            pred.get("prob_draw"), pred.get("prob_away"), pred.get("confidence"),
-            int(pred.get("is_value_bet", 0)), pred.get("edge"), pred.get("kelly_stake"), pred.get("odd_used"),
-            pred.get("home_injuries_out", 0), pred.get("home_injuries_dtd", 0),
-            pred.get("away_injuries_out", 0), pred.get("away_injuries_dtd", 0),
-            pred.get("method"),
-            pred.get("odd_used"),   # odd_opening = odd at prediction time
-            pred.get("market"),
-        ))
-        conn.commit()
+        with get_conn() as conn:
+            conn.execute(f"""
+                INSERT INTO predictions
+                (sport,league,home_team,away_team,match_date,pred_result,
+                 prob_home,prob_draw,prob_away,confidence,is_value_bet,edge,kelly_stake,odd_used,
+                 home_injuries_out,home_injuries_dtd,away_injuries_out,away_injuries_dtd,
+                 method,odd_opening,market)
+                VALUES ({','.join([ph]*21)})
+            """, (
+                pred.get("sport"), pred.get("league"), pred.get("home_team"), pred.get("away_team"),
+                pred.get("match_date"), pred.get("pred_result"), pred.get("prob_home"),
+                pred.get("prob_draw"), pred.get("prob_away"), pred.get("confidence"),
+                int(pred.get("is_value_bet", 0)), pred.get("edge"), pred.get("kelly_stake"), pred.get("odd_used"),
+                pred.get("home_injuries_out", 0), pred.get("home_injuries_dtd", 0),
+                pred.get("away_injuries_out", 0), pred.get("away_injuries_dtd", 0),
+                pred.get("method"),
+                pred.get("odd_used"),
+                pred.get("market"),
+            ))
     except Exception as e:
-        conn.rollback()
-        logger.error(f"save_prediction rollback ({pred.get('home_team')} vs {pred.get('away_team')}): {e}")
+        logger.error(f"save_prediction ({pred.get('home_team')} vs {pred.get('away_team')}): {e}")
         raise
-    finally:
-        conn.close()
 
 
 def get_team_exposure(team_name: str) -> float:
@@ -846,16 +851,16 @@ def get_team_exposure(team_name: str) -> float:
     Compte les paris H où home_team = team et les paris A où away_team = team.
     Utilisé pour limiter la concentration sur un seul club (MAX_TEAM_EXPOSURE_PCT).
     """
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute("""
-        SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
-        WHERE outcome IS NULL AND kelly_stake > 0
-          AND (
-            (pred_result = 'H' AND home_team = ?) OR
-            (pred_result = 'A' AND away_team = ?)
-          )
-    """, (team_name, team_name)).fetchone()
-    conn.close()
+    from db import get_conn, ph
+    with get_conn() as conn:
+        row = conn.execute(f"""
+            SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
+            WHERE outcome IS NULL AND kelly_stake > 0
+              AND (
+                (pred_result = 'H' AND home_team = {ph}) OR
+                (pred_result = 'A' AND away_team = {ph})
+              )
+        """, (team_name, team_name)).fetchone()
     return float(row[0]) if row else 0.0
 
 
@@ -865,20 +870,21 @@ def count_active_bets_for_league(league: str) -> int:
     Utilisé pour la diversification : max MAX_ACTIVE_BETS_PER_LEAGUE par ligue.
     Les signaux Over/Under ne sont pas comptés (marché indépendant).
     """
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute("""
-        SELECT COUNT(*) FROM predictions
-        WHERE league = ?
-          AND outcome IS NULL
-          AND kelly_stake > 0
-          AND pred_result IN ('H', 'D', 'A')
-    """, (league,)).fetchone()
-    conn.close()
+    from db import get_conn, ph
+    with get_conn() as conn:
+        row = conn.execute(f"""
+            SELECT COUNT(*) FROM predictions
+            WHERE league = {ph}
+              AND outcome IS NULL
+              AND kelly_stake > 0
+              AND pred_result IN ('H', 'D', 'A')
+        """, (league,)).fetchone()
     return int(row[0]) if row else 0
 
 
 def get_all_predictions() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
+    from db import raw_conn
+    conn = raw_conn()
     df = pd.read_sql_query("SELECT * FROM predictions ORDER BY created_at DESC", conn)
     conn.close()
     return df
@@ -890,15 +896,15 @@ def is_already_predicted(home_team: str, away_team: str, match_date: str) -> boo
     de création. Basé sur DATE(match_date) pour éviter les paris en double sur
     plusieurs cycles (08h/18h) ou plusieurs jours avant le match.
     """
+    from db import get_conn, ph
     try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("""
-            SELECT id FROM predictions
-            WHERE home_team = ? AND away_team = ?
-              AND DATE(match_date) = DATE(?)
-            LIMIT 1
-        """, (home_team, away_team, match_date)).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute(f"""
+                SELECT id FROM predictions
+                WHERE home_team = {ph} AND away_team = {ph}
+                  AND DATE(match_date) = DATE({ph})
+                LIMIT 1
+            """, (home_team, away_team, match_date)).fetchone()
         return row is not None
     except Exception as e:
         logger.error(f"is_already_predicted error: {e}")

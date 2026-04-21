@@ -303,7 +303,23 @@ def train():
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
     logger.info(f"Modèle BTTS sauvegardé : {MODEL_PATH}")
-    return float(np.mean(fold_accs))
+
+    final_acc = float(np.mean(fold_accs))
+    final_ll  = float(np.mean(fold_lls))
+
+    # AG — MLflow / model registry
+    try:
+        from model_registry import log_run
+        log_run("btts", {
+            "accuracy":   final_acc,
+            "log_loss":   final_ll,
+            "n_samples":  len(X),
+            "n_features": len(FEATURE_COLS),
+        })
+    except Exception as e:
+        logger.warning(f"model_registry log failed: {e}")
+
+    return final_acc
 
 
 if __name__ == "__main__":
