@@ -74,6 +74,7 @@ echo ""
 echo "  Vérification syntaxe..."
 SYNTAX_OK=true
 for f in "${FILES[@]}"; do
+    [[ "$f" != *.py ]] && continue   # vérifie uniquement les fichiers Python
     result=$(ssh "$VPS_HOST" "cd $VPS_DIR && venv/bin/python -m py_compile $f 2>&1" || true)
     if [ -n "$result" ]; then
         echo "  ✗ Erreur syntaxe dans $f :"
