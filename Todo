@@ -77,11 +77,9 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
 
 ## 🔴 Priorité 1 — Impact élevé modèle
 
-### AI — Dixon-Coles correction
-  Corrige le modèle de Poisson pour les scores faibles (0-0, 1-0, 0-1)
-  systématiquement sous-estimés — standard dans l'industrie
-  Paramètre ρ (rho) calibré sur données historiques
-  Attendu : +1-2% accuracy sur marchés buts
+### ✅ AI — Dixon-Coles correction — FAIT
+  dixon_coles.py — τ correction, calibration ρ MLE, dc_1x2/dc_over_under/dc_correct_scores
+  Intégré dans model.py (blend 70% XGB + 30% DC sur OU) et train_from_csv.py (calibration auto)
 
 ### AJ — LSTM / séquences temporelles
   RNN sur les 10 derniers matchs de chaque équipe
@@ -95,18 +93,18 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
   Source : Understat player stats
   Attendu : +1% accuracy
 
-### AL — Modèle Correct Score (Poisson bivarié)
-  Probabilités exactes pour chaque score (1-0, 2-1, 0-0…)
-  Marché très mal calibré par les bookmakers → edge important
-  Génère des alertes sur les scores value (cote > 1/probabilité)
+### ✅ AL — Modèle Correct Score (Poisson bivarié) — FAIT
+  build_correct_score_signal() dans model.py — dc_correct_scores, edge ≥ 12%, prob ≥ 8%
+  fetch_correct_score_odds() via The Odds API "correct_score" market
+  send_correct_score_alert() dans telegram_bot.py + intégré dans predictor.py
 
 
 ## 🟠 Priorité 2 — Données supplémentaires
 
-### AM — Reverse Line Movement
-  Cote monte alors que le public mise dans l'autre sens
-  Signal sharp très fort — les bookmakers suivent l'argent, pas les tickets
-  Croisement avec ticket % vs money % (source : The Odds API)
+### ✅ AM — Reverse Line Movement — FAIT
+  detect_rlm() dans model.py — mouvement ≥ 4%, public ≥ 55% côté opposé
+  fetch_opening_odds() via The Odds API (Pinnacle/Betfair/Unibet)
+  RLM enrichit le signal principal + send_rlm_alert() pour score ≥ 0.60
 
 ### AN — Fixture congestion précise
   Nombre de matchs sur 21 jours + probabilité de rotation

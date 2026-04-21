@@ -180,32 +180,14 @@ class BettingModel:
 
     def _predict_poisson_prior(self, features: dict) -> dict:
         """
-        Calcule P(H), P(D), P(A) via distribution de Poisson bivariée.
-        Utilisée avant entraînement XGBoost ou en fallback.
+        Calcule P(H), P(D), P(A) via Dixon-Coles (Poisson corrigé scores faibles).
         """
+        from dixon_coles import dc_1x2, load_rho
         lam_h = features.get("home_lambda", 1.4)
         lam_a = features.get("away_lambda", 1.1)
-
-        max_goals = 8
-        prob_home = prob_draw = prob_away = 0.0
-
-        for i in range(max_goals + 1):
-            for j in range(max_goals + 1):
-                p = poisson.pmf(i, lam_h) * poisson.pmf(j, lam_a)
-                if i > j:
-                    prob_home += p
-                elif i == j:
-                    prob_draw += p
-                else:
-                    prob_away += p
-
-        total = prob_home + prob_draw + prob_away
-        return {
-            "prob_home": round(prob_home / total, 4),
-            "prob_draw": round(prob_draw / total, 4),
-            "prob_away": round(prob_away / total, 4),
-            "method":    "poisson"
-        }
+        rho   = load_rho("global")
+        probs = dc_1x2(lam_h, lam_a, rho)
+        return {**probs, "method": "dixon_coles"}
 
     def _predict_nba_prior(self, features: dict) -> dict:
         """Prior NBA basé sur win_rate et différentiel de points."""
@@ -415,7 +397,21 @@ def build_ou_signal(features: dict, ou_odds_row: dict,
 
     proba     = ou_model.predict_proba(features)
     prob_over = proba.get("prob_over", proba.get("prob_home", 0))
-    vb        = detect_ou_value_bet(prob_over, ou_odds_row)
+
+    # AI — Confirmation Dixon-Coles : aligner XGBoost et DC avant de signaler
+    try:
+        from dixon_coles import dc_over_under, load_rho
+        lam_h = features.get("home_lambda", 1.4)
+        lam_a = features.get("away_lambda", 1.1)
+        rho   = load_rho("global")
+        dc_ou = dc_over_under(lam_h, lam_a, rho)
+        dc_over = dc_ou["prob_over"]
+        # Moyenne pondérée : XGBoost 70% + DC 30%
+        prob_over = round(0.70 * prob_over + 0.30 * dc_over, 4)
+    except Exception:
+        pass
+
+    vb = detect_ou_value_bet(prob_over, ou_odds_row)
     if vb is None:
         return None
 
@@ -431,7 +427,7 @@ def build_ou_signal(features: dict, ou_odds_row: dict,
         "prob_draw":   0.0,
         "prob_away":   round(1 - prob_over, 4),
         "confidence":  round(vb["p_model"], 4),
-        "method":      proba.get("method", "xgboost_ou"),
+        "method":      proba.get("method", "xgboost_ou") + "+dc",
         "value_bets":  [vb],
         "is_value_bet": True,
         "edge":        vb["edge"],
@@ -666,6 +662,237 @@ def detect_implied_value(model_proba: dict, odds_by_bookmaker: dict,
 
     value_bets.sort(key=lambda x: x["edge"], reverse=True)
     return value_bets
+
+
+# ════════════════════════════════════════════════════════════
+# AL — CORRECT SCORE (Dixon-Coles bivarié)
+# ════════════════════════════════════════════════════════════
+
+CS_EDGE_MIN   = 0.12   # edge minimum pour Correct Score (marché à haute variance)
+CS_MIN_PROB   = 0.08   # probabilité modèle minimum pour alerter
+
+def build_correct_score_signal(features: dict, cs_odds: dict,
+                               match_info: dict) -> dict | None:
+    """
+    Détecte des value bets sur le marché Correct Score.
+
+    cs_odds : dict {"1-0": 7.50, "2-1": 9.00, ...} — cotes bookmaker par score.
+    Retourne le meilleur value bet ou None.
+    """
+    if not cs_odds:
+        return None
+
+    try:
+        from dixon_coles import dc_correct_scores, load_rho
+    except ImportError:
+        return None
+
+    lam_h = features.get("home_lambda", 1.4)
+    lam_a = features.get("away_lambda", 1.1)
+    rho   = load_rho("global")
+
+    model_scores = dc_correct_scores(lam_h, lam_a, rho, top_n=25)
+    model_dict   = {s["score"]: s["prob"] for s in model_scores}
+
+    best_vb = None
+    for score_key, odd in cs_odds.items():
+        if not isinstance(odd, (int, float)) or odd <= 1:
+            continue
+        p_model   = model_dict.get(score_key, 0.0)
+        p_implied = 1.0 / odd
+        edge      = p_model - p_implied
+        ev        = p_model * (odd - 1) - (1 - p_model)
+
+        if p_model < CS_MIN_PROB:
+            continue
+        if edge < CS_EDGE_MIN:
+            continue
+        if ev <= 0:
+            continue
+
+        vb = {
+            "score":     score_key,
+            "p_model":   round(p_model,   4),
+            "p_implied": round(p_implied, 4),
+            "edge":      round(edge,      4),
+            "odd":       round(odd,       3),
+            "ev":        round(ev,        4),
+        }
+        if best_vb is None or vb["edge"] > best_vb["edge"]:
+            best_vb = vb
+
+    if best_vb is None:
+        return None
+
+    # Top 5 scores modèle pour affichage dans l'alerte
+    top5 = model_scores[:5]
+
+    return {
+        "sport":        "football",
+        "league":       match_info.get("league", ""),
+        "home_team":    match_info.get("home_team", ""),
+        "away_team":    match_info.get("away_team", ""),
+        "match_date":   match_info.get("date", ""),
+        "pred_result":  f"CS_{best_vb['score']}",
+        "pred_name":    f"Score exact {best_vb['score']}",
+        "prob_home":    best_vb["p_model"],
+        "prob_draw":    0.0,
+        "prob_away":    0.0,
+        "confidence":   best_vb["p_model"],
+        "method":       "dixon_coles_cs",
+        "is_value_bet": True,
+        "edge":         best_vb["edge"],
+        "odd_used":     best_vb["odd"],
+        "market":       "CS",
+        "value_bets":   [best_vb],
+        "top_scores":   top5,
+    }
+
+
+def fetch_correct_score_odds(league_key: str) -> dict:
+    """
+    Récupère les cotes Correct Score depuis The Odds API.
+    Retourne dict {home_team|away_team: {"1-0": 7.5, ...}}.
+    """
+    try:
+        from data_fetcher import _odds_get
+        data = _odds_get(f"sports/{league_key}/odds", {
+            "regions": "eu",
+            "markets": "h2h_lay,scorers",
+            "oddsFormat": "decimal",
+        }, ttl=180)
+        if not data or not isinstance(data, list):
+            return {}
+
+        result = {}
+        for event in data:
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            key  = f"{home}|{away}"
+            cs_odds = {}
+            for book in event.get("bookmakers", []):
+                for market in book.get("markets", []):
+                    if market.get("key") == "correct_score":
+                        for outcome in market.get("outcomes", []):
+                            name = outcome.get("name", "")
+                            price = outcome.get("price", 0)
+                            # Format "2-1" ou "Home 2-1" → normalise
+                            parts = name.replace("Home ", "").replace("Away ", "").strip()
+                            if "-" in parts:
+                                cs_odds[parts] = float(price)
+                        break
+                if cs_odds:
+                    break
+            if cs_odds:
+                result[key] = cs_odds
+        return result
+    except Exception as e:
+        logger.debug(f"fetch_correct_score_odds: {e}")
+        return {}
+
+
+# ════════════════════════════════════════════════════════════
+# AM — REVERSE LINE MOVEMENT
+# ════════════════════════════════════════════════════════════
+
+RLM_MIN_LINE_MOVE = 0.04   # la cote doit bouger d'au moins 4% depuis l'ouverture
+RLM_MIN_PUBLIC    = 0.55   # au moins 55% des mises publiques du mauvais côté
+
+def detect_rlm(odds_opening: dict, odds_current: dict,
+               public_bets_pct: dict | None = None) -> list[dict]:
+    """
+    Détecte un Reverse Line Movement sur les cotes 1X2.
+
+    odds_opening  : {"H": 2.10, "D": 3.40, "A": 3.20} — cotes à l'ouverture
+    odds_current  : {"H": 2.20, "D": 3.35, "A": 3.10} — cotes actuelles
+    public_bets_pct : {"H": 0.60, "D": 0.20, "A": 0.20} — % billets public
+                      Si None, le critère public est ignoré.
+
+    Retourne une liste de signals RLM :
+    [{"outcome": "H", "odd_open": 2.10, "odd_current": 2.20,
+      "line_move_pct": 0.048, "public_pct": 0.60, "rlm_score": 0.85}, ...]
+
+    Logique :
+      Si la cote MONTE (odd_current > odd_open) d'au moins RLM_MIN_LINE_MOVE
+      et que le public mise majoritairement SUR ce côté (public_pct >= RLM_MIN_PUBLIC),
+      c'est un RLM : les books défavorisent ce outcome malgré le public.
+      → Les sharps ont misé sur l'autre côté et les books se couvrent.
+    """
+    signals = []
+    for outcome in ("H", "D", "A"):
+        open_ = odds_opening.get(outcome)
+        curr  = odds_current.get(outcome)
+        if not open_ or not curr or open_ <= 1 or curr <= 1:
+            continue
+
+        line_move = (curr - open_) / open_   # positif = cote monte
+        if line_move < RLM_MIN_LINE_MOVE:
+            continue
+
+        pub = (public_bets_pct or {}).get(outcome, 0.0)
+        if public_bets_pct and pub < RLM_MIN_PUBLIC:
+            continue
+
+        # RLM score : produit normalisé des deux signaux
+        move_score = min(line_move / 0.10, 1.0)    # 10% move → score max
+        pub_score  = min((pub - 0.5) / 0.3, 1.0) if public_bets_pct else 0.5
+        rlm_score  = round((move_score + pub_score) / 2, 3)
+
+        signals.append({
+            "outcome":       outcome,
+            "odd_open":      round(open_, 3),
+            "odd_current":   round(curr,  3),
+            "line_move_pct": round(line_move, 4),
+            "public_pct":    round(pub, 3),
+            "rlm_score":     rlm_score,
+        })
+
+    signals.sort(key=lambda x: x["rlm_score"], reverse=True)
+    return signals
+
+
+def fetch_opening_odds(league_key: str) -> dict:
+    """
+    Récupère les cotes d'ouverture via The Odds API (bookmaker pinnacle ou
+    premier dispo avec historique). Retourne dict {home|away: {"H":…, "D":…, "A":…}}.
+    """
+    try:
+        from data_fetcher import _odds_get
+        data = _odds_get(f"sports/{league_key}/odds", {
+            "regions":    "eu",
+            "markets":    "h2h",
+            "oddsFormat": "decimal",
+            "bookmakers": "pinnacle,betfair_ex_eu,unibet",
+        }, ttl=300)
+        if not data or not isinstance(data, list):
+            return {}
+
+        result = {}
+        for event in data:
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            key  = f"{home}|{away}"
+            for book in event.get("bookmakers", []):
+                for market in book.get("markets", []):
+                    if market.get("key") != "h2h":
+                        continue
+                    outcomes = market.get("outcomes", [])
+                    h_odd = next((o["price"] for o in outcomes if o["name"] == home), None)
+                    d_odd = next((o["price"] for o in outcomes if o["name"] == "Draw"), None)
+                    a_odd = next((o["price"] for o in outcomes if o["name"] == away), None)
+                    if h_odd and a_odd:
+                        result[key] = {
+                            "H": float(h_odd),
+                            "D": float(d_odd) if d_odd else None,
+                            "A": float(a_odd),
+                        }
+                        break
+                if key in result:
+                    break
+        return result
+    except Exception as e:
+        logger.debug(f"fetch_opening_odds: {e}")
+        return {}
 
 
 # ════════════════════════════════════════════════════════════

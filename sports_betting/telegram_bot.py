@@ -109,6 +109,12 @@ def send_prediction_alert(signal: dict, stake_info: dict):
             weather_parts.append(f"🌡️ {temp_c:.0f}°C")
         lines += ["", f"⛈️ <b>Conditions météo :</b> {' | '.join(weather_parts)}"]
 
+    # RLM — Reverse Line Movement détecté
+    if signal.get("rlm_detected"):
+        rlm_move = signal.get("rlm_line_move", 0)
+        rlm_sc   = signal.get("rlm_score", 0)
+        lines += ["", f"📡 <b>Reverse Line Movement :</b> cote ↑ {rlm_move:+.1%} contre le public (score {rlm_sc:.2f}) ⚡ Sharp money"]
+
     # xG Understat — AE
     h_xg  = signal.get("home_xg_avg", 0)
     a_xg  = signal.get("away_xg_avg", 0)
@@ -430,3 +436,63 @@ def _prob_bar(p: float, length: int = 10) -> str:
     """Barre de progression ASCII."""
     filled = round(p * length)
     return "█" * filled + "░" * (length - filled)
+
+
+def send_correct_score_alert(signal: dict, stake_info: dict):
+    """Alerte Telegram pour un value bet Correct Score (marché AL)."""
+    vb = signal["value_bets"][0]
+    top = signal.get("top_scores", [])
+
+    lines = [
+        "🎯 <b>VALUE BET — CORRECT SCORE</b>",
+        "",
+        f"⚽ <b>{signal['home_team']} vs {signal['away_team']}</b>",
+        f"🏆 {signal.get('league', '')}",
+        f"📅 {signal.get('match_date', '')[:10]}",
+        "",
+        f"<b>Score prédit :</b> {vb['score']}",
+        f"<b>Proba modèle :</b> {vb['p_model']:.1%}",
+        f"<b>Proba implicite :</b> {vb['p_implied']:.1%}",
+        f"<b>Edge :</b> +{vb['edge']:.1%}",
+        f"<b>Cote :</b> {vb['odd']:.2f}",
+        f"<b>EV :</b> {vb['ev']:+.3f}",
+    ]
+
+    if stake_info.get("stake_amount", 0) > 0:
+        lines += [
+            "",
+            "💰 <b>Mise recommandée (Kelly) :</b>",
+            f"  • {stake_info['stake_amount']:,.0f} FCFA ({stake_info['stake_pct']:.1%} bankroll)",
+        ]
+
+    if top:
+        lines += ["", "📊 <b>Top 5 scores modèle :</b>"]
+        for s in top[:5]:
+            bar = _prob_bar(s["prob"], length=8)
+            lines.append(f"  {s['score']:>4}  {s['prob']:.1%}  {bar}")
+
+    lines += ["", "─" * 30, "🤖 BetMind Agent"]
+    send_message("\n".join(lines))
+
+
+def send_rlm_alert(home_team: str, away_team: str, league: str,
+                   outcome: str, odd_open: float, odd_current: float,
+                   line_move_pct: float, public_pct: float):
+    """Alerte Reverse Line Movement : ligne monte contre le public."""
+    lines = [
+        "📡 <b>REVERSE LINE MOVEMENT</b>",
+        "",
+        f"⚽ <b>{home_team} vs {away_team}</b>",
+        f"🏆 {league}",
+        "",
+        f"<b>Outcome :</b> {outcome}",
+        f"<b>Cote ouverture :</b> {odd_open:.2f}",
+        f"<b>Cote actuelle  :</b> <b>{odd_current:.2f}</b>  ({line_move_pct:+.1%})",
+        f"<b>% mises public :</b> {public_pct:.0f}% contre ce side",
+        "",
+        "⚡ <b>Signal Sharp :</b> la ligne monte CONTRE le public.",
+        "Les bookmakers suivent l'argent professionnel.",
+        "",
+        "🤖 BetMind Agent"
+    ]
+    send_message("\n".join(lines))

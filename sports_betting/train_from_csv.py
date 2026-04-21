@@ -1175,6 +1175,15 @@ def train():
     final_ll  = float(np.mean(fold_lls))
     logger.info(f"Accuracy walk-forward : {final_acc:.1%}")
 
+    # AI — Calibration Dixon-Coles ρ
+    try:
+        from dixon_coles import calibrate_from_csv, save_rho
+        rho = calibrate_from_csv(all_df)
+        save_rho(rho, "global")
+        logger.info(f"Dixon-Coles ρ global = {rho:.5f}")
+    except Exception as e:
+        logger.warning(f"Dixon-Coles calibration failed: {e}")
+
     # AG — MLflow / model registry
     try:
         from model_registry import log_run

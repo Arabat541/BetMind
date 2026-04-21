@@ -20,9 +20,9 @@ from data_fetcher import (
     get_fd_quota_used, count_active_bets_for_league, get_team_exposure,
 )
 from feature_engineering import build_football_features, build_nba_features
-from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage
+from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds
 from bankroll import BankrollTracker, recommended_stake
-from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert
+from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +75,8 @@ def run_football_predictions():
     league_ou_odds_map   = {lg: fetch_football_ou_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
     league_btts_odds_map = {lg: fetch_football_btts_odds(key) for lg, key in _LEAGUE_KEYS.items()}
     league_ah_odds_map   = {lg: fetch_football_ah_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
+    league_cs_odds_map   = {lg: fetch_correct_score_odds(key) for lg, key in _LEAGUE_KEYS.items()}
+    league_open_odds_map = {lg: fetch_opening_odds(key)       for lg, key in _LEAGUE_KEYS.items()}
 
     signals       = []
     bankroll      = tracker.get_balance()
@@ -164,6 +166,48 @@ def run_football_predictions():
 
             if _should_alert(signal):
                 send_prediction_alert(signal, stake_info)
+
+            # ── AM — Reverse Line Movement ────────────────────────
+            open_odds_all = league_open_odds_map.get(fix["league"], {})
+            if open_odds_all and odds_row:
+                open_odds_event = {}
+                for event_key, oo in open_odds_all.items():
+                    h_part = event_key.split("|")[0] if "|" in event_key else ""
+                    if fix["home_team"].split()[0].lower() in h_part.lower():
+                        open_odds_event = oo
+                        break
+                if open_odds_event:
+                    curr_odds = {
+                        "H": float(odds_row.get("odd_home") or 0) or None,
+                        "D": float(odds_row.get("odd_draw") or 0) or None,
+                        "A": float(odds_row.get("odd_away") or 0) or None,
+                    }
+                    rlm_signals = detect_rlm(open_odds_event, curr_odds)
+                    for rlm in rlm_signals:
+                        outcome_names = {"H": "Domicile", "D": "Nul", "A": "Extérieur"}
+                        logger.info(
+                            f"  [RLM] {fix['home_team']} vs {fix['away_team']} — "
+                            f"{outcome_names[rlm['outcome']]} cote "
+                            f"{rlm['odd_open']} → {rlm['odd_current']} "
+                            f"({rlm['line_move_pct']:+.1%}) score={rlm['rlm_score']}"
+                        )
+                        # Enrich le signal principal avec le flag RLM si l'outcome correspond
+                        if rlm["outcome"] == signal.get("pred_result"):
+                            signal["rlm_detected"]  = True
+                            signal["rlm_score"]     = rlm["rlm_score"]
+                            signal["rlm_line_move"] = rlm["line_move_pct"]
+                        # Alerte Telegram dédiée pour les RLM forts (score ≥ 0.6)
+                        if rlm["rlm_score"] >= 0.60:
+                            send_rlm_alert(
+                                home_team=fix["home_team"],
+                                away_team=fix["away_team"],
+                                league=fix["league"],
+                                outcome=outcome_names[rlm["outcome"]],
+                                odd_open=rlm["odd_open"],
+                                odd_current=rlm["odd_current"],
+                                line_move_pct=rlm["line_move_pct"],
+                                public_pct=rlm["public_pct"],
+                            )
 
             # ── Arbitrage / implied value multi-bookmakers — M ─
             try:
@@ -303,6 +347,47 @@ def run_football_predictions():
                 save_prediction(mkt_sig)
                 if _should_alert(mkt_sig):
                     send_prediction_alert(mkt_sig, mkt_stake)
+
+            # ── AL — Correct Score (Dixon-Coles bivarié) ─────────
+            cs_odds_all = league_cs_odds_map.get(fix["league"], {})
+            if cs_odds_all and daily_staked < daily_limit:
+                # Cherche l'événement correspondant dans le dict {home|away: {...}}
+                cs_odds_event = {}
+                for event_key, odds in cs_odds_all.items():
+                    h_part = event_key.split("|")[0] if "|" in event_key else ""
+                    if fix["home_team"].split()[0].lower() in h_part.lower():
+                        cs_odds_event = odds
+                        break
+                if cs_odds_event:
+                    cs_sig = build_correct_score_signal(
+                        features=features,
+                        cs_odds=cs_odds_event,
+                        match_info={
+                            "league":    fix["league"],
+                            "home_team": fix["home_team"],
+                            "away_team": fix["away_team"],
+                            "date":      fix["date"],
+                        }
+                    )
+                    if cs_sig:
+                        remaining_cs = daily_limit - daily_staked
+                        cs_stake = recommended_stake(cs_sig, bankroll)
+                        if cs_stake["stake_amount"] > remaining_cs:
+                            cs_stake["stake_amount"] = round(remaining_cs)
+                            cs_stake["stake_pct"] = round(remaining_cs / bankroll, 4) if bankroll > 0 else 0
+                        cs_sig["kelly_stake"]    = cs_stake["stake_amount"]
+                        cs_sig["stake_pct"]      = cs_stake["stake_pct"]
+                        cs_sig["expected_value"] = cs_stake.get("expected_value", 0)
+                        daily_staked += cs_stake["stake_amount"]
+                        signals.append(cs_sig)
+                        _log_signal(cs_sig, cs_stake)
+                        save_prediction(cs_sig)
+                        send_correct_score_alert(cs_sig, cs_stake)
+                        logger.info(
+                            f"  [CS] Value bet: {fix['home_team']} vs {fix['away_team']} "
+                            f"score {cs_sig['value_bets'][0]['score']} "
+                            f"edge={cs_sig['edge']:.1%} @ {cs_sig['odd_used']:.2f}"
+                        )
 
             time.sleep(0.2)
 
