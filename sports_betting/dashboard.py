@@ -400,6 +400,39 @@ TEMPLATE = """
     </div>
   </div>
 
+  <!-- AF — xG + Squad values widget -->
+  <div class="chart-card" style="margin-bottom:16px;" id="xg-squad-section">
+    <div class="table-header" style="margin-bottom:12px;">
+      <span class="table-title">⚽ xG Understat &amp; 💶 Valeurs effectifs</span>
+      <span style="color:var(--muted);font-size:12px;font-family:'JetBrains Mono'">Rolling 8 matchs</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <div>
+        <div style="color:var(--muted);font-size:11px;font-family:'JetBrains Mono';margin-bottom:6px;">TOP xG OFFENSIF</div>
+        <table style="width:100%;font-size:12px;">
+          <thead><tr>
+            <th style="text-align:left;color:var(--muted);font-weight:400;padding:2px 6px">#</th>
+            <th style="text-align:left;color:var(--muted);font-weight:400;padding:2px 6px">Équipe</th>
+            <th style="text-align:right;color:var(--muted);font-weight:400;padding:2px 6px">xG</th>
+            <th style="text-align:right;color:var(--muted);font-weight:400;padding:2px 6px">xGA</th>
+          </tr></thead>
+          <tbody id="xg-tbody"></tbody>
+        </table>
+      </div>
+      <div>
+        <div style="color:var(--muted);font-size:11px;font-family:'JetBrains Mono';margin-bottom:6px;">TOP VALEUR MARCHANDE</div>
+        <table style="width:100%;font-size:12px;">
+          <thead><tr>
+            <th style="text-align:left;color:var(--muted);font-weight:400;padding:2px 6px">#</th>
+            <th style="text-align:left;color:var(--muted);font-weight:400;padding:2px 6px">Équipe</th>
+            <th style="text-align:right;color:var(--muted);font-weight:400;padding:2px 6px">M€</th>
+          </tr></thead>
+          <tbody id="sq-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <!-- Predictions table -->
   <div class="table-card">
     <div class="table-header">
@@ -458,7 +491,7 @@ let allPreds = [];
 })();
 
 async function loadData() {
-  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes, clvRes] = await Promise.all([
+  const [statsRes, predsRes, roiRes, bkRes, expRes, confRes, modelsRes, marketRes, brierRes, sharpRes, clvRes, xgSqRes] = await Promise.all([
     fetch('/api/stats'),
     fetch('/api/predictions'),
     fetch('/api/roi_by_league'),
@@ -470,6 +503,7 @@ async function loadData() {
     fetch('/api/brier_score'),
     fetch('/api/sharp_money'),
     fetch('/api/clv'),
+    fetch('/api/xg_squad'),
   ]);
 
   const stats     = await statsRes.json();
@@ -483,6 +517,7 @@ async function loadData() {
   const brier     = await brierRes.json();
   const sharp     = await sharpRes.json();
   const clv       = await clvRes.json();
+  const xgSq      = await xgSqRes.json();
   allPreds = preds;
 
   document.getElementById('updated').textContent = new Date().toLocaleTimeString('fr-FR');
@@ -560,6 +595,39 @@ async function loadData() {
   buildRoiTable(roiData);
   buildLeagueChart(roiData);
   buildMarketTable(marketData);
+  buildXgSquadWidget(xgSq);
+}
+
+function buildXgSquadWidget(data) {
+  const xgBody = document.getElementById('xg-tbody');
+  const sqBody = document.getElementById('sq-tbody');
+  if (!xgBody || !sqBody) return;
+
+  const medals = ['🥇','🥈','🥉'];
+  const xgColor = v => v >= 2.0 ? 'var(--green)' : v >= 1.5 ? 'var(--gold)' : 'var(--muted)';
+  const xgaColor = v => v <= 1.0 ? 'var(--green)' : v <= 1.5 ? 'var(--gold)' : 'var(--red)';
+
+  xgBody.innerHTML = (data.xg || []).map((r, i) => `
+    <tr>
+      <td style="padding:3px 6px;color:var(--muted);font-size:11px">${medals[i] || (i+1)}</td>
+      <td style="padding:3px 6px;font-family:'JetBrains Mono';font-size:12px">${r.team.substring(0,22)}</td>
+      <td style="padding:3px 6px;text-align:right;font-family:'JetBrains Mono';color:${xgColor(r.xg_avg)}">${r.xg_avg.toFixed(2)}</td>
+      <td style="padding:3px 6px;text-align:right;font-family:'JetBrains Mono';color:${xgaColor(r.xga_avg)}">${r.xga_avg.toFixed(2)}</td>
+    </tr>`).join('');
+
+  const maxVal = Math.max(...(data.squad || []).map(r => r.value_m), 1);
+  sqBody.innerHTML = (data.squad || []).map((r, i) => {
+    const barPct = Math.round(r.value_m / maxVal * 100);
+    const barColor = i === 0 ? 'var(--gold)' : i < 3 ? 'var(--accent)' : 'var(--accent2)';
+    return `<tr>
+      <td style="padding:3px 6px;color:var(--muted);font-size:11px">${medals[i] || (i+1)}</td>
+      <td style="padding:3px 6px;font-family:'JetBrains Mono';font-size:12px">
+        ${r.team.substring(0,20)}
+        <div style="height:3px;width:${barPct}%;background:${barColor};opacity:.6;border-radius:2px;margin-top:2px"></div>
+      </td>
+      <td style="padding:3px 6px;text-align:right;font-family:'JetBrains Mono';color:${barColor}">${r.value_m >= 1000 ? (r.value_m/1000).toFixed(2)+'bn' : r.value_m.toFixed(0)+'M'}</td>
+    </tr>`;
+  }).join('');
 }
 
 function buildExposureBar(data) {
@@ -1285,6 +1353,40 @@ def api_run():
     from predictor import run_all
     signals = run_all()
     return jsonify({"status": "ok", "signals": len(signals)})
+
+
+@app.route("/api/xg_squad")
+def api_xg_squad():
+    import json as _json
+    from config import DATA_DIR
+    xg_path  = os.path.join(DATA_DIR, "understat_xg_history.json")
+    sq_path  = os.path.join(DATA_DIR, "squad_values.json")
+
+    # xG — compute rolling avg over last 8 matches for each team
+    xg_rows = []
+    if os.path.exists(xg_path):
+        with open(xg_path) as f:
+            xg_hist = _json.load(f)
+        for team, matches in xg_hist.items():
+            if not matches:
+                continue
+            recent = matches[-8:]
+            xg_avg  = round(sum(m[1] for m in recent) / len(recent), 2)
+            xga_avg = round(sum(m[2] for m in recent) / len(recent), 2)
+            xg_rows.append({"team": team, "xg_avg": xg_avg, "xga_avg": xga_avg})
+        xg_rows.sort(key=lambda r: r["xg_avg"], reverse=True)
+        xg_rows = xg_rows[:20]
+
+    # Squad values — top 20
+    sq_rows = []
+    if os.path.exists(sq_path):
+        with open(sq_path) as f:
+            sq_vals = _json.load(f)
+        sq_rows = [{"team": k, "value_m": v} for k, v in sq_vals.items()]
+        sq_rows.sort(key=lambda r: r["value_m"], reverse=True)
+        sq_rows = sq_rows[:20]
+
+    return jsonify({"xg": xg_rows, "squad": sq_rows})
 
 
 if __name__ == "__main__":
