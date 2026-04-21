@@ -359,6 +359,10 @@ def get_feature_columns(sport: str = "football") -> list:
             # Fatigue — E
             "home_days_since_last", "away_days_since_last",
             "home_fatigue",         "away_fatigue",
+            # xG réel Understat — W (signal direct pour OU)
+            "home_xg_avg", "away_xg_avg",
+            "home_xga_avg", "away_xga_avg",
+            "xg_diff", "xga_diff",
         ]
     elif sport == "btts_football":
         return [
@@ -373,6 +377,10 @@ def get_feature_columns(sport: str = "football") -> list:
             "home_sot_ag_avg",    "away_sot_ag_avg",
             "home_days_since_last", "away_days_since_last",
             "home_fatigue",         "away_fatigue",
+            # xG réel Understat — W (signal direct pour BTTS)
+            "home_xg_avg", "away_xg_avg",
+            "home_xga_avg", "away_xga_avg",
+            "xg_diff", "xga_diff",
         ]
     elif sport == "nba":
         return [

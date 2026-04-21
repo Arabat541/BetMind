@@ -109,6 +109,28 @@ def send_prediction_alert(signal: dict, stake_info: dict):
             weather_parts.append(f"🌡️ {temp_c:.0f}°C")
         lines += ["", f"⛈️ <b>Conditions météo :</b> {' | '.join(weather_parts)}"]
 
+    # xG Understat — AE
+    h_xg  = signal.get("home_xg_avg", 0)
+    a_xg  = signal.get("away_xg_avg", 0)
+    h_xga = signal.get("home_xga_avg", 0)
+    a_xga = signal.get("away_xga_avg", 0)
+    if h_xg or a_xg:
+        lines += [
+            "",
+            "⚽ <b>xG récents (Understat) :</b>",
+            f"  🏠 {signal['home_team'][:18]}: xG {h_xg:.2f} | xGA {h_xga:.2f}",
+            f"  ✈️  {signal['away_team'][:18]}: xG {a_xg:.2f} | xGA {a_xga:.2f}",
+        ]
+
+    # Valeur marchande effectifs — AE
+    vr = signal.get("squad_value_ratio", 0)
+    hv = signal.get("home_squad_value", 0)
+    av = signal.get("away_squad_value", 0)
+    if hv and av and vr and vr != 1.0:
+        fav   = signal["home_team"] if vr >= 1 else signal["away_team"]
+        ratio = vr if vr >= 1 else round(1 / vr, 2)
+        lines += ["", f"💶 <b>Effectifs :</b> {fav[:18]} ×{ratio:.1f} plus cher ({hv:.0f}M€ vs {av:.0f}M€)"]
+
     lines += ["", "─" * 30, "🤖 BetMind Agent"]
     send_message("\n".join(lines))
 

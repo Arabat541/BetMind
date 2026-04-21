@@ -47,6 +47,20 @@ $NOTIFY && send_telegram "🔄 *BetMind Retrain démarré* — $(date '+%Y-%m-%d
 
 STATUS=0
 
+# ── 0. Refresh données externes ──────────────────────────────
+echo ""
+echo "[ 0/3 ] Refresh xG Understat + Transfermarkt..."
+if $PYTHON understat_fetcher.py; then
+    echo "  ✓ xG Understat OK"
+else
+    echo "  ⚠ xG Understat ERREUR (non bloquant)"
+fi
+if $PYTHON transfermarkt_fetcher.py; then
+    echo "  ✓ Transfermarkt OK"
+else
+    echo "  ⚠ Transfermarkt ERREUR (non bloquant)"
+fi
+
 # ── 1. Football (1X2 + ensemble + SHAP) ─────────────────────
 echo ""
 echo "[ 1/3 ] Football 1X2 + Ensemble..."

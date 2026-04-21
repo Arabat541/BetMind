@@ -29,6 +29,7 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from config import MODELS_DIR
+from understat_fetcher import load_xg_history, get_team_xg_rolling
 
 MODEL_PATH = os.path.join(MODELS_DIR, "btts_football_xgb_model.pkl")
 BASE_URL   = "https://www.football-data.co.uk/mmz4281"
@@ -54,6 +55,10 @@ FEATURE_COLS = [
     "home_sot_ag_avg", "away_sot_ag_avg",
     "home_days_since_last", "away_days_since_last",
     "home_fatigue", "away_fatigue",
+    # xG réel Understat — W
+    "home_xg_avg", "away_xg_avg",
+    "home_xga_avg", "away_xga_avg",
+    "xg_diff", "xga_diff",
 ]
 
 AVG_GOALS = 2.5
@@ -150,7 +155,24 @@ def h2h_btts_stats(all_df: pd.DataFrame, home: str, away: str,
     }
 
 
-def build_features(row: pd.Series, all_df: pd.DataFrame) -> dict | None:
+def _xg_features(home: str, away: str, date, xg_history: dict | None) -> dict:
+    default = {"home_xg_avg": 0.0, "away_xg_avg": 0.0,
+               "home_xga_avg": 0.0, "away_xga_avg": 0.0,
+               "xg_diff": 0.0, "xga_diff": 0.0}
+    if not xg_history:
+        return default
+    h = get_team_xg_rolling(xg_history, home, before_date=date, window=8)
+    a = get_team_xg_rolling(xg_history, away, before_date=date, window=8)
+    return {
+        "home_xg_avg":  h["xg_avg"],  "away_xg_avg":  a["xg_avg"],
+        "home_xga_avg": h["xga_avg"], "away_xga_avg": a["xga_avg"],
+        "xg_diff":  round(h["xg_avg"]  - a["xg_avg"],  4),
+        "xga_diff": round(h["xga_avg"] - a["xga_avg"], 4),
+    }
+
+
+def build_features(row: pd.Series, all_df: pd.DataFrame,
+                   xg_history: dict | None = None) -> dict | None:
     home, away, date = row["HomeTeam"], row["AwayTeam"], row["Date"]
     hs  = team_stats_before(all_df, home, date)
     as_ = team_stats_before(all_df, away, date)
@@ -188,6 +210,8 @@ def build_features(row: pd.Series, all_df: pd.DataFrame) -> dict | None:
         "away_days_since_last": as_["days_since"],
         "home_fatigue":         hs["fatigue"],
         "away_fatigue":         as_["fatigue"],
+        # xG réel Understat — W
+        **_xg_features(home, away, date, xg_history),
     }
 
 
@@ -212,11 +236,15 @@ def train():
     all_df = pd.concat(frames, ignore_index=True).sort_values("Date").reset_index(drop=True)
     logger.info(f"Total matchs chargés : {len(all_df)}")
 
+    xg_history = load_xg_history()
+    if xg_history:
+        logger.info(f"xG Understat chargé : {len(xg_history)} équipes")
+
     rows_X, rows_y = [], []
     for i, row in all_df.iterrows():
         label = 1 if (int(row["FTHG"]) > 0 and int(row["FTAG"]) > 0) else 0
 
-        feats = build_features(row, all_df)
+        feats = build_features(row, all_df, xg_history=xg_history)
         if feats is None:
             continue
 
