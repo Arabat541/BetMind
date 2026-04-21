@@ -143,6 +143,12 @@ FEATURE_COLS = [
     "xg_diff", "xga_diff",
     # Valeur marchande effectifs — Y
     "home_squad_value", "away_squad_value", "squad_value_ratio",
+    # LSTM form score — AJ
+    "home_lstm_form", "away_lstm_form", "lstm_form_diff",
+    # Player-level xG loss — AK
+    "home_xg_loss", "away_xg_loss",
+    "home_xg_loss_pct", "away_xg_loss_pct",
+    "home_top_scorer_share", "away_top_scorer_share",
 ]
 
 
@@ -1183,6 +1189,13 @@ def train():
         logger.info(f"Dixon-Coles ρ global = {rho:.5f}")
     except Exception as e:
         logger.warning(f"Dixon-Coles calibration failed: {e}")
+
+    # AJ — Entraînement LSTM form extractor
+    try:
+        from form_lstm import train_lstm_from_df
+        train_lstm_from_df(all_df, epochs=20)
+    except Exception as e:
+        logger.warning(f"FormLSTM training failed (non bloquant): {e}")
 
     # AG — MLflow / model registry
     try:

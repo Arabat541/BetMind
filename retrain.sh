@@ -49,11 +49,16 @@ STATUS=0
 
 # ── 0. Refresh données externes ──────────────────────────────
 echo ""
-echo "[ 0/3 ] Refresh xG Understat + Transfermarkt..."
+echo "[ 0/4 ] Refresh xG Understat + Player xG + Transfermarkt..."
 if $PYTHON understat_fetcher.py; then
-    echo "  ✓ xG Understat OK"
+    echo "  ✓ xG Understat (équipes) OK"
 else
     echo "  ⚠ xG Understat ERREUR (non bloquant)"
+fi
+if $PYTHON -c "from understat_fetcher import fetch_and_save_player_xg; fetch_and_save_player_xg()"; then
+    echo "  ✓ Player xG (AK) OK"
+else
+    echo "  ⚠ Player xG ERREUR (non bloquant)"
 fi
 if $PYTHON transfermarkt_fetcher.py; then
     echo "  ✓ Transfermarkt OK"
@@ -61,9 +66,9 @@ else
     echo "  ⚠ Transfermarkt ERREUR (non bloquant)"
 fi
 
-# ── 1. Football (1X2 + ensemble + SHAP) ─────────────────────
+# ── 1. Football (1X2 + ensemble + SHAP + LSTM) ───────────────
 echo ""
-echo "[ 1/3 ] Football 1X2 + Ensemble..."
+echo "[ 1/4 ] Football 1X2 + Ensemble + LSTM..."
 if $PYTHON train_from_csv.py; then
     echo "  ✓ Football OK"
 else
@@ -73,7 +78,7 @@ fi
 
 # ── 2. Over/Under ───────────────────────────────────────────
 echo ""
-echo "[ 2/3 ] Over/Under..."
+echo "[ 2/4 ] Over/Under..."
 if $PYTHON train_over_under.py; then
     echo "  ✓ Over/Under OK"
 else
@@ -83,12 +88,30 @@ fi
 
 # ── 3. BTTS ─────────────────────────────────────────────────
 echo ""
-echo "[ 3/3 ] BTTS..."
+echo "[ 3/4 ] BTTS..."
 if $PYTHON train_btts.py; then
     echo "  ✓ BTTS OK"
 else
     echo "  ✗ BTTS ERREUR"
     STATUS=1
+fi
+
+# ── 4. LSTM form extractor (AJ) ──────────────────────────────
+echo ""
+echo "[ 4/4 ] LSTM form extractor (AJ)..."
+if $PYTHON -c "
+import sys; sys.path.insert(0, '.')
+from form_lstm import FormLSTM
+import logging; logging.basicConfig(level=logging.WARNING)
+print('  LSTM module OK (keras:', end=' ')
+try:
+    import tensorflow; print('disponible)')
+except ImportError:
+    print('fallback numpy)')
+"; then
+    echo "  ✓ LSTM OK"
+else
+    echo "  ⚠ LSTM ERREUR (non bloquant — fallback numpy actif)"
 fi
 
 echo ""

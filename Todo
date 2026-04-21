@@ -58,14 +58,14 @@
 
 ## 🟡 Priorité 3 — Infrastructure
 
-### AG — MLflow model registry
-  Historique des métriques à chaque retrain (accuracy, Brier, log-loss, CLV)
-  Détection automatique de dégradation du modèle entre saisons
-  UI légère sur le VPS
+### ✅ AG — MLflow model registry — FAIT
+  model_registry.py — log_run() + dégradation Telegram si delta accuracy < -2%
+  Historique JSON (data/model_registry.json) + widget dashboard /api/model_history
 
-### AH — PostgreSQL + Redis
-  SQLite → PostgreSQL pour concurrence (dashboard + predictor + result_checker)
-  Redis pour cache des cotes (TTL 5min) → évite appels API répétés
+### ✅ AH — PostgreSQL + Redis — FAIT
+  db.py — _PgConnWrapper, get_conn(), ph, adapt_ddl() — SQLite/PG transparent
+  cache.py — cached_get() Redis + fallback mémoire TTL 5min
+  data_fetcher.py + bankroll.py migrés — DATABASE_URL dans .env VPS
 
 
 ## ✅ Toutes les features A→AH complétées — 2026-04-21

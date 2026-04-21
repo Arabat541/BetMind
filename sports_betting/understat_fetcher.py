@@ -183,6 +183,139 @@ def get_team_xg_rolling(history: dict, team_name: str,
 
 
 # ════════════════════════════════════════════════════════════
+# AK — PLAYER-LEVEL xG (contribution par joueur)
+# ════════════════════════════════════════════════════════════
+
+PLAYER_XG_PATH = os.path.join(DATA_DIR, "understat_player_xg.json")
+
+# Cache en mémoire
+_player_xg_cache: dict | None = None
+
+
+def fetch_and_save_player_xg(seasons: list | None = None) -> dict:
+    """
+    Récupère les stats xG par joueur depuis understat.com.
+    Stocke : {team_name: [(player_name, apps, xg_total, xg_per_game), ...]}
+    Sauvegarde dans data/understat_player_xg.json.
+    """
+    try:
+        import understatapi
+    except ImportError:
+        logger.error("understatapi non installé — pip install understatapi")
+        return {}
+
+    seasons = seasons or ["2024", "2023"]   # les 2 saisons les plus récentes suffisent
+    player_data: dict[str, list] = {}
+
+    with understatapi.UnderstatClient() as understat:
+        for league_name in UNDERSTAT_LEAGUES:
+            for season in seasons:
+                try:
+                    teams_data = understat.league(league=league_name).get_team_data(season=season)
+                    for team_id, team_info in teams_data.items():
+                        team = team_info.get("title", "")
+                        if not team:
+                            continue
+                        try:
+                            players = understat.team(team=team).get_player_data(season=season)
+                            team_players = []
+                            for p in players:
+                                apps   = int(p.get("games", 0) or 0)
+                                xg_tot = float(p.get("xG", 0) or 0)
+                                if apps < 3:   # trop peu de matchs pour être fiable
+                                    continue
+                                team_players.append({
+                                    "name":       p.get("player_name", ""),
+                                    "apps":       apps,
+                                    "xg_total":   round(xg_tot, 3),
+                                    "xg_per_game": round(xg_tot / apps, 4) if apps > 0 else 0.0,
+                                })
+                            team_players.sort(key=lambda x: x["xg_per_game"], reverse=True)
+                            player_data[team] = team_players
+                            time.sleep(0.3)
+                        except Exception as e:
+                            logger.debug(f"  Player xG {team}/{season}: {e}")
+                except Exception as e:
+                    logger.warning(f"  Player xG {league_name}/{season}: {e}")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PLAYER_XG_PATH, "w", encoding="utf-8") as f:
+        json.dump(player_data, f)
+
+    n_teams   = len(player_data)
+    n_players = sum(len(v) for v in player_data.values())
+    logger.info(f"Player xG sauvegardé : {PLAYER_XG_PATH} ({n_teams} équipes, {n_players} joueurs)")
+    return player_data
+
+
+def load_player_xg() -> dict:
+    """Charge et met en cache le fichier player xG. Retourne {} si absent."""
+    global _player_xg_cache
+    if _player_xg_cache is not None:
+        return _player_xg_cache
+    if not os.path.exists(PLAYER_XG_PATH):
+        logger.debug("understat_player_xg.json absent — features player xG désactivées")
+        _player_xg_cache = {}
+        return _player_xg_cache
+    try:
+        with open(PLAYER_XG_PATH, encoding="utf-8") as f:
+            _player_xg_cache = json.load(f)
+        n = sum(len(v) for v in _player_xg_cache.values())
+        logger.info(f"Player xG chargé : {len(_player_xg_cache)} équipes, {n} joueurs")
+    except Exception as e:
+        logger.warning(f"Erreur lecture player xG : {e}")
+        _player_xg_cache = {}
+    return _player_xg_cache
+
+
+def get_player_xg_loss(player_xg: dict, team_name: str,
+                       n_absent: int = 0) -> dict:
+    """
+    Estime la perte xG due aux absences dans l'équipe.
+
+    n_absent : nombre de joueurs OUT (depuis le rapport ESPN).
+    Hypothèse : les joueurs absents sont tirés parmi les top contributeurs
+    xG (worst-case : les meilleurs attaquants manquent).
+
+    Retourne :
+        {
+          "xg_loss":             float,   # perte xG par match estimée
+          "xg_loss_pct":         float,   # % de xG équipe perdu
+          "top_player_xg_share": float,   # part xG du meilleur joueur
+        }
+    """
+    default = {"xg_loss": 0.0, "xg_loss_pct": 0.0, "top_player_xg_share": 0.0}
+    if not player_xg or n_absent <= 0:
+        return default
+
+    canonical = _find_team(player_xg, team_name)
+    if canonical is None:
+        return default
+
+    players = player_xg[canonical]   # [{name, apps, xg_total, xg_per_game}, ...]
+    if not players:
+        return default
+
+    # xG total de l'équipe = somme par joueur (sert à normaliser)
+    total_xg_per_game = sum(p["xg_per_game"] for p in players)
+    if total_xg_per_game <= 0:
+        return default
+
+    # Top contributeur
+    top_share = round(players[0]["xg_per_game"] / total_xg_per_game, 4)
+
+    # xG perdu = somme des n_absent meilleurs contributeurs (worst-case)
+    lost = sum(p["xg_per_game"] for p in players[:n_absent])
+    xg_loss_pct = round(min(lost / total_xg_per_game, 1.0), 4)
+
+    return {
+        "xg_loss":             round(lost,     4),
+        "xg_loss_pct":         xg_loss_pct,
+        "top_player_xg_share": top_share,
+    }
+
+
+# ════════════════════════════════════════════════════════════
 # ENTRÉE PRINCIPALE (pour refresh manuel)
 # ════════════════════════════════════════════════════════════
 

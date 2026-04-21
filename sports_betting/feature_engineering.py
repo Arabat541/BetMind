@@ -11,7 +11,7 @@ from data_fetcher import (
     fetch_match_weather, get_team_elo,
 )
 from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
-from understat_fetcher import load_xg_history, get_team_xg_rolling
+from understat_fetcher import load_xg_history, get_team_xg_rolling, load_player_xg, get_player_xg_loss
 from transfermarkt_fetcher import load_squad_values, get_squad_value_features
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,84 @@ def build_football_features(home_id: int, away_id: int,
     sq_vals = load_squad_values()
     features.update(get_squad_value_features(sq_vals, home_name, away_name))
 
+    # ── AJ — LSTM form score ─────────────────────────────────
+    try:
+        from form_lstm import get_lstm_form, _get_lstm
+        lstm = _get_lstm()
+        h_out = home_stats.get("injuries_out", 0)
+        a_out = away_stats.get("injuries_out", 0)
+        # Construit les séquences depuis home_stats / away_stats si disponibles
+        h_seq = _build_match_sequence_from_stats(home_stats)
+        a_seq = _build_match_sequence_from_stats(away_stats)
+        features["home_lstm_form"] = round(get_lstm_form(home_name, match_history=h_seq), 4)
+        features["away_lstm_form"] = round(get_lstm_form(away_name, match_history=a_seq), 4)
+        features["lstm_form_diff"] = round(features["home_lstm_form"] - features["away_lstm_form"], 4)
+    except Exception:
+        features["home_lstm_form"] = features["home_form"]
+        features["away_lstm_form"] = features["away_form"]
+        features["lstm_form_diff"] = features["form_diff"]
+
+    # ── AK — Player-level xG loss ────────────────────────────
+    try:
+        p_xg = load_player_xg()
+        h_out  = home_stats.get("injuries_out", 0)
+        a_out  = away_stats.get("injuries_out", 0)
+        h_loss = get_player_xg_loss(p_xg, home_name, n_absent=int(h_out))
+        a_loss = get_player_xg_loss(p_xg, away_name, n_absent=int(a_out))
+        features.update({
+            "home_xg_loss":         h_loss["xg_loss"],
+            "away_xg_loss":         a_loss["xg_loss"],
+            "home_xg_loss_pct":     h_loss["xg_loss_pct"],
+            "away_xg_loss_pct":     a_loss["xg_loss_pct"],
+            "home_top_scorer_share": h_loss["top_player_xg_share"],
+            "away_top_scorer_share": a_loss["top_player_xg_share"],
+        })
+    except Exception:
+        for k in ("home_xg_loss", "away_xg_loss", "home_xg_loss_pct",
+                  "away_xg_loss_pct", "home_top_scorer_share", "away_top_scorer_share"):
+            features[k] = 0.0
+
     return features
+
+
+def _build_match_sequence_from_stats(stats: dict) -> list:
+    """
+    Reconstruit une séquence de matchs à partir des stats agrégées.
+    Si `recent_results` (list de dicts) est disponible dans stats, l'utilise.
+    Sinon, génère une séquence synthétique depuis les moyennes.
+    Retourne [(result, gf, ga, was_home, xg, xga), ...].
+    """
+    if not stats:
+        return []
+
+    recent = stats.get("recent_results", [])
+    if recent:
+        seq = []
+        for m in recent[-10:]:
+            gf   = m.get("goals_for",     1)
+            ga   = m.get("goals_against", 1)
+            home = m.get("was_home",      1)
+            xg   = m.get("xg",            0.0)
+            xga  = m.get("xga",           0.0)
+            if gf > ga:
+                r = 1.0
+            elif gf < ga:
+                r = 0.0
+            else:
+                r = 0.5
+            seq.append((r, int(gf), int(ga), int(home), float(xg), float(xga)))
+        return seq
+
+    # Fallback : synthétique depuis les agrégats
+    form_score  = stats.get("form_score", 0.5)
+    gf_avg      = stats.get("goals_for_avg", 1.2)
+    ga_avg      = stats.get("goals_ag_avg",  1.2)
+    n           = min(int(stats.get("played", 5)), 10)
+    seq = []
+    for _ in range(n):
+        r = 1.0 if form_score > 0.6 else (0.5 if form_score > 0.35 else 0.0)
+        seq.append((r, round(gf_avg), round(ga_avg), 1, 0.0, 0.0))
+    return seq
 
 
 def _win_rate(stats: dict) -> float:
