@@ -25,77 +25,44 @@
 ### ✅ Q — Alertes Telegram enrichies (sharp money + météo) — FAIT
 ### ✅ M — Arbitrage / implied value multi-bookmakers — FAIT
 ### ✅ R — deploy.sh redémarre betmind + betmind-dashboard — FAIT
+### ✅ S — ELO dynamique par équipe — FAIT
+  home_elo, away_elo, elo_diff dans FEATURE_COLS + elo_ratings_current.json
+### ✅ T — Suppression du vig (Shin method) — FAIT
+  shin_probabilities() dans model.py — edge calculé vs vraie proba implicite
+### ✅ U — Variance ensemble comme filtre de rejet — FAIT
+  std > 0.08 entre XGB et LGB → skip ou réduction de mise
+### ✅ V — CLV (Closing Line Value) comme KPI principal — FAIT
+  KPI dashboard + alerte Telegram hebdo si CLV moyen < 0 sur 30 paris
+### ✅ W — xG réel depuis Understat — FAIT
+  understat_fetcher.py — 137 équipes, 21 414 entrées — rolling 8 matchs
+  SHAP : home_xg_avg = 9ème feature la plus importante (0.0123)
+### ✅ X — Feature arbitre — FAIT
+  referee_avg_goals, referee_home_bias dans FEATURE_COLS
+### ✅ Y — Valeur marchande effectifs (Transfermarkt) — FAIT
+  transfermarkt_fetcher.py — 96 équipes — squad_value_ratio = 6ème SHAP (0.0257)
+### ✅ Z — Corrélation entre marchés OU/BTTS — FAIT
+  Over+BTTS Yes → +20% mise ; Over+No BTTS → les deux ignorés
+### ✅ AA — Drawdown global stop-loss — FAIT
+  Drawdown > 20% depuis peak → pause complète + alerte Telegram
+### ✅ AB — Closing odds comme feature modèle — FAIT
+  impl_cl_*, cl_move_* depuis BbClH/D/A dans les CSVs football-data
+### ✅ AC — retrain.sh : refresh Understat + Transfermarkt avant retrain — FAIT
+  Étape 0/3 : fetch xG + squad values avant chaque entraînement hebdo
+### ✅ AD — xG features dans train_over_under.py + train_btts.py — FAIT
+  6 features xG ajoutées aux deux modèles secondaires
+### ✅ AE — Telegram : xG + squad_value_ratio dans alertes prédiction — FAIT
+  Section xG récents (Understat) + ratio valeur effectifs dans send_prediction_alert()
+### ✅ AF — Dashboard : widget xG et valeurs marchandes — FAIT
+  Widget deux colonnes + endpoint /api/xg_squad + fetch parallèle dans loadData()
 
 
-## 🔴 Priorité 1 — Impact élevé modèle
+## 🟡 Priorité 3 — Infrastructure
 
-### S — ELO dynamique par équipe
-  Rating ELO mis à jour après chaque match (O(1) par match)
-  Feature home_elo, away_elo, elo_diff ajoutées dans FEATURE_COLS
-  Calcul dans train_from_csv.py + sauvegarde models/elo_ratings.json
-  Attendu : +1-2% accuracy
-
-### T — Suppression du vig (Shin method)
-  Convertir les cotes bookmaker en probas "propres" sans margin (≈5%)
-  Fonction shin_probabilities(odd_H, odd_D, odd_A) dans model.py
-  Edge calculé vs vraie proba implicite → moins de faux positifs
-  Attendu : meilleure fiabilité de l'edge détecté
-
-### U — Variance ensemble comme filtre de rejet
-  Calculer std(prob_home_xgb, prob_home_lgb) par outcome
-  Si std > 0.08 → prédiction incohérente entre modèles → skip ou réduire mise
-  Ajout champ pred_variance dans signal + colonne dashboard
-
-### V — CLV (Closing Line Value) comme KPI principal
-  get_avg_clv() existe déjà dans bankroll.py mais non utilisé
-  Afficher CLV moyen dans dashboard KPIs + alerte Telegram hebdo
-  Si CLV moyen < 0 sur 30 derniers paris → alerte "edge perdu"
-  Standard de l'industrie pour mesurer si l'edge est réel
-
-
-## 🟠 Priorité 2 — Données supplémentaires
-
-### W — xG réel depuis Understat (scraping)
-  fetch_understat_xg(team, season) via understatapi ou scraping HTML
-  Remplace shots proxy (corrélation 0.85) par vraies valeurs xG
-  Attendu : +1% accuracy
-
-### X — Feature arbitre
-  Colonne Referee disponible dans football-data.co.uk CSVs
-  Features : referee_avg_goals, referee_home_bias (sur 2 saisons)
-  Signal niche — utile pour les matchs à enjeu
-
-### Y — Valeur marchande effectifs (Transfermarkt)
-  Squad value comme proxy de qualité réelle (surtout début de saison)
-  Scraping simple : home_squad_value, away_squad_value, value_ratio
-  Stabilise les prédictions quand la forme récente est peu significative
-
-
-## 🟡 Priorité 3 — Stratégie & Risk Management
-
-### Z — Corrélation entre marchés (signal combiné)
-  Si BTTS=oui ET O/U>2.5 signalent le même match → mise combinée +20%
-  Si signaux contradictoires (BTTS=non ET O/U>2.5) → ignorer les deux
-  Logique dans predictor.py après génération des signaux
-
-### AA — Drawdown global stop-loss
-  Si drawdown > 20% depuis le peak bankroll → pause complète
-  Actuellement : stop-loss journalier + par ligue, mais pas de stop global
-  Alerte Telegram + flag dans DB → aucune nouvelle mise jusqu'à review
-
-### AB — Odd de fermeture comme feature modèle
-  odd_closing comme feature dans FEATURE_COLS (pas seulement signal post-prédiction)
-  Capture l'information agrégée des sharps avant le match
-  Disponible via The Odds API (historical closing lines)
-
-
-## 🟢 Priorité 4 — Infrastructure
-
-### AC — MLflow model registry
+### AG — MLflow model registry
   Historique des métriques à chaque retrain (accuracy, Brier, log-loss, CLV)
   Détection automatique de dégradation du modèle entre saisons
   UI légère sur le VPS
 
-### AD — PostgreSQL + Redis
+### AH — PostgreSQL + Redis
   SQLite → PostgreSQL pour concurrence (dashboard + predictor + result_checker)
   Redis pour cache des cotes (TTL 5min) → évite appels API répétés
