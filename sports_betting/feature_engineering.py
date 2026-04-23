@@ -13,6 +13,8 @@ from data_fetcher import (
 from config import FORM_WINDOW, FORM_WINDOW_LONG, MIN_MATCHES_MODEL
 from understat_fetcher import load_xg_history, get_team_xg_rolling, load_player_xg, get_player_xg_loss
 from transfermarkt_fetcher import load_squad_values, get_squad_value_features
+from fixture_congestion import build_congestion_features
+from travel_distance import build_travel_features
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +215,28 @@ def build_football_features(home_id: int, away_id: int,
     except Exception:
         for k in ("home_xg_loss", "away_xg_loss", "home_xg_loss_pct",
                   "away_xg_loss_pct", "home_top_scorer_share", "away_top_scorer_share"):
+            features[k] = 0.0
+
+    # ── AN — Fixture congestion précise ──────────────────────
+    try:
+        today_str = __import__("datetime").date.today().isoformat()
+        cong = build_congestion_features(
+            home_name, away_name,
+            match_date=today_str,
+            xg_history=xg_hist,
+        )
+        features.update(cong)
+    except Exception:
+        for k in ("home_congestion", "away_congestion",
+                  "home_has_europe", "away_has_europe",
+                  "home_congestion_score", "away_congestion_score"):
+            features[k] = 0.0
+
+    # ── AO — Distance déplacement Away ───────────────────────
+    try:
+        features.update(build_travel_features(home_name, away_name))
+    except Exception:
+        for k in ("away_travel_km", "away_timezone_diff", "away_travel_score"):
             features[k] = 0.0
 
     return features

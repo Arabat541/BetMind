@@ -896,6 +896,370 @@ def fetch_opening_odds(league_key: str) -> dict:
 
 
 # ════════════════════════════════════════════════════════════
+# AQ — BOTH HALVES GOALS (BHG)
+# ════════════════════════════════════════════════════════════
+# Les deux équipes marquent dans CHAQUE mi-temps (not just overall BTTS).
+# Probabilité dérivée du modèle de Poisson bivarié Dixon-Coles.
+# On suppose indépendance des deux mi-temps et distribution symétrique
+# (chaque équipe marque ~50% de ses buts en chaque mi-temps).
+
+BHG_EDGE_MIN = 0.10   # edge minimum — marché moins liquide que BTTS
+BHG_MIN_PROB = 0.15   # prob modèle minimum pour alerter
+
+def _bhg_probability(home_lambda: float, away_lambda: float,
+                     home_half_ratio: float = 0.5,
+                     away_half_ratio: float = 0.5) -> float:
+    """
+    Probabilité que les deux équipes marquent dans chaque mi-temps.
+
+    On modélise chaque mi-temps comme Poisson indépendant :
+      - λ_home_H1 = home_lambda * home_half_ratio
+      - λ_away_H1 = away_lambda * away_half_ratio
+
+    P(BHG) = P(home scores in H1) * P(away scores in H1)
+           * P(home scores in H2) * P(away scores in H2)
+
+    P(équipe marque dans une mi-temps) = 1 - P(0 but) = 1 - e^{-λ}
+    """
+    lh1 = home_lambda * home_half_ratio
+    la1 = away_lambda * away_half_ratio
+    lh2 = home_lambda * (1 - home_half_ratio)
+    la2 = away_lambda * (1 - away_half_ratio)
+
+    p_h1 = 1 - np.exp(-lh1)
+    p_a1 = 1 - np.exp(-la1)
+    p_h2 = 1 - np.exp(-lh2)
+    p_a2 = 1 - np.exp(-la2)
+
+    return round(p_h1 * p_a1 * p_h2 * p_a2, 4)
+
+
+def build_bhg_signal(features: dict, bhg_odds_row: dict,
+                     match_info: dict) -> dict | None:
+    """
+    Détecte un value bet sur le marché Both Halves Goals.
+
+    bhg_odds_row : dict {"odd_bhg": float, "odd_no_bhg": float}
+    Retourne le signal value bet ou None.
+    """
+    if not bhg_odds_row:
+        return None
+
+    odd_bhg    = bhg_odds_row.get("odd_bhg")
+    odd_no_bhg = bhg_odds_row.get("odd_no_bhg")
+
+    if not odd_bhg:
+        return None
+
+    # Probabilité modèle via Poisson
+    home_lam = features.get("home_lambda", 1.2)
+    away_lam = features.get("away_lambda", 1.0)
+
+    # Ratios mi-temps ajustés si on a des stats HT disponibles
+    home_ratio = features.get("home_ht_goal_ratio", 0.5)
+    away_ratio = features.get("away_ht_goal_ratio", 0.5)
+
+    prob_bhg = _bhg_probability(home_lam, away_lam, home_ratio, away_ratio)
+
+    result = None
+    for side, prob, odd in [
+        ("BHG",    prob_bhg,        odd_bhg),
+        ("No BHG", 1 - prob_bhg,    odd_no_bhg),
+    ]:
+        if odd is None or odd <= 1.0:
+            continue
+        try:
+            odd = float(odd)
+        except (TypeError, ValueError):
+            continue
+        impl = round(1 / odd, 4)
+        edge = round(prob - impl, 4)
+        ev   = round(prob * odd - 1, 4)
+        if edge >= BHG_EDGE_MIN and ev > 0 and prob >= BHG_MIN_PROB:
+            result = {
+                "side":        side,
+                "prob_model":  prob,
+                "prob_impl":   impl,
+                "edge":        edge,
+                "ev":          ev,
+                "odd":         odd,
+                "result_name": ("Les deux équipes marquent dans chaque mi-temps"
+                                if side == "BHG"
+                                else "Pas de BHG dans les deux mi-temps"),
+                **match_info,
+            }
+
+    return result
+
+
+def fetch_bhg_odds(league_key: str) -> dict:
+    """
+    Récupère les cotes Both Halves Goals via The Odds API.
+    Marché : "both_halves_goals" (si disponible) ou "btts" (proxy).
+    Retourne {event_id: {"odd_bhg": float, "odd_no_bhg": float}}.
+    """
+    from config import THE_ODDS_API_KEY, ODDS_API_BASE
+    if not THE_ODDS_API_KEY:
+        return {}
+
+    try:
+        import requests
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/{league_key}/odds",
+            params={
+                "apiKey":   THE_ODDS_API_KEY,
+                "markets":  "both_halves_goals",
+                "regions":  "eu",
+                "oddsFormat": "decimal",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+
+        out = {}
+        for event in resp.json():
+            eid = event.get("id", "")
+            for book in event.get("bookmakers", []):
+                for mkt in book.get("markets", []):
+                    if mkt.get("key") not in ("both_halves_goals", "both_teams_to_score"):
+                        continue
+                    o = {}
+                    for out_come in mkt.get("outcomes", []):
+                        nm = out_come.get("name", "").lower()
+                        price = out_come.get("price")
+                        if nm in ("yes", "bhg"):
+                            o["odd_bhg"] = price
+                        elif nm in ("no", "no bhg"):
+                            o["odd_no_bhg"] = price
+                    if o:
+                        out[eid] = o
+                        break
+                if eid in out:
+                    break
+        return out
+    except Exception:
+        return {}
+
+
+# ════════════════════════════════════════════════════════════
+# AS — LINE SHOPPING MULTI-BOOKMAKERS
+# ════════════════════════════════════════════════════════════
+
+def get_best_odds(league_key: str, home_team: str, away_team: str) -> dict:
+    """
+    Récupère les meilleures cotes 1X2 disponibles sur 5+ bookmakers via The Odds API.
+
+    Retourne:
+    {
+      "best_odd_home":  float,  "best_book_home":  str,
+      "best_odd_draw":  float,  "best_book_draw":  str,
+      "best_odd_away":  float,  "best_book_away":  str,
+      "bookmakers_checked": int,
+    }
+    ou dict vide si erreur.
+    """
+    from config import THE_ODDS_API_KEY, ODDS_API_BASE
+    if not THE_ODDS_API_KEY:
+        return {}
+
+    try:
+        import requests
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/{league_key}/odds",
+            params={
+                "apiKey":     THE_ODDS_API_KEY,
+                "markets":    "h2h",
+                "regions":    "eu,uk,us",
+                "oddsFormat": "decimal",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+
+        home_lower = home_team.lower().split()[0]
+        away_lower = away_team.lower().split()[0]
+
+        target_event = None
+        for event in resp.json():
+            h = event.get("home_team", "").lower()
+            a = event.get("away_team", "").lower()
+            if home_lower in h and away_lower in a:
+                target_event = event
+                break
+
+        if not target_event:
+            return {}
+
+        best = {"H": (0.0, ""), "D": (0.0, ""), "A": (0.0, "")}
+        n_books = 0
+
+        for book in target_event.get("bookmakers", []):
+            bk_name = book.get("title", "")
+            for mkt in book.get("markets", []):
+                if mkt.get("key") != "h2h":
+                    continue
+                n_books += 1
+                for o in mkt.get("outcomes", []):
+                    nm = o.get("name", "")
+                    p  = float(o.get("price", 0))
+                    if nm == target_event.get("home_team") and p > best["H"][0]:
+                        best["H"] = (p, bk_name)
+                    elif nm == target_event.get("away_team") and p > best["A"][0]:
+                        best["A"] = (p, bk_name)
+                    elif nm == "Draw" and p > best["D"][0]:
+                        best["D"] = (p, bk_name)
+
+        return {
+            "best_odd_home":  best["H"][0],
+            "best_book_home": best["H"][1],
+            "best_odd_draw":  best["D"][0],
+            "best_book_draw": best["D"][1],
+            "best_odd_away":  best["A"][0],
+            "best_book_away": best["A"][1],
+            "bookmakers_checked": n_books,
+        }
+    except Exception:
+        return {}
+
+
+def enrich_signal_with_line_shop(signal: dict, league_key: str) -> dict:
+    """
+    Enrichit un signal avec les meilleures cotes disponibles (AS).
+    Ajoute best_odd_available, best_book, line_shop_gain.
+    """
+    home = signal.get("home_team", "")
+    away = signal.get("away_team", "")
+    best = get_best_odds(league_key, home, away)
+    if not best:
+        return signal
+
+    result = signal.get("predicted_result", signal.get("side", ""))
+    outcome_map = {"H": "home", "D": "draw", "A": "away"}
+    key = outcome_map.get(result, "home")
+
+    best_odd = best.get(f"best_odd_{key}", 0.0)
+    best_bk  = best.get(f"best_book_{key}", "")
+    used_odd = signal.get("odd_used", signal.get("odd", 0.0))
+
+    signal["best_odd_available"] = best_odd
+    signal["best_book"]          = best_bk
+    signal["line_shop_gain"]     = round(best_odd - used_odd, 3) if best_odd and used_odd else 0.0
+    signal["bookmakers_checked"] = best.get("bookmakers_checked", 0)
+
+    if best_odd > used_odd + 0.05:
+        logger.info(
+            f"  [AS] Line shop: {home} vs {away} — use {best_bk} @ {best_odd:.2f} "
+            f"vs current {used_odd:.2f} (+{best_odd - used_odd:.2f})"
+        )
+    return signal
+
+
+# ════════════════════════════════════════════════════════════
+# AR — DUTCHING MULTI-OUTCOMES
+# ════════════════════════════════════════════════════════════
+# Répartir la mise sur plusieurs outcomes pour profit garanti
+# quand la somme des probabilités implicites < 1 (sur-cotes réelles).
+
+def dutch_stakes(outcomes: list[dict], total_stake: float) -> list[dict]:
+    """
+    Calcule les mises Dutching pour garantir un profit identique
+    quel que soit le résultat parmi les outcomes sélectionnés.
+
+    outcomes : [{"name": str, "odd": float, "prob_model": float}, ...]
+    total_stake : mise totale en unités monétaires.
+
+    Retourne outcomes enrichis avec "dutch_stake" et "dutch_return".
+    Retourne [] si pas de profit garanti possible.
+
+    Formule Dutch :
+      stake_i = total_stake * (1/odd_i) / sum(1/odd_j)
+      guaranteed_return = total_stake / sum(1/odd_j)
+      profit si guaranteed_return > total_stake (sum impl < 1)
+    """
+    if not outcomes:
+        return []
+
+    odds = [float(o["odd"]) for o in outcomes]
+    if any(od <= 1.0 for od in odds):
+        return []
+
+    impl_sum = sum(1 / od for od in odds)
+    if impl_sum >= 1.0:
+        return []  # pas d'opportunité Dutch (somme prob implicites ≥ 1)
+
+    guaranteed_return = total_stake / impl_sum
+    profit = guaranteed_return - total_stake
+
+    result = []
+    for o, od in zip(outcomes, odds):
+        stake_i = round(total_stake * (1 / od) / impl_sum, 2)
+        result.append({
+            **o,
+            "dutch_stake":  stake_i,
+            "dutch_return": round(guaranteed_return, 2),
+            "dutch_profit": round(profit, 2),
+            "dutch_roi":    round(profit / total_stake, 4) if total_stake > 0 else 0.0,
+        })
+    return result
+
+
+def detect_dutching_opportunity(odds_row: dict,
+                                proba: dict,
+                                match_info: dict,
+                                total_stake: float = 100.0,
+                                min_profit_pct: float = 0.02) -> dict | None:
+    """
+    Détecte une opportunité Dutching sur les 3 issues 1X2.
+
+    Cherche les combinaisons Home+Away, Home+Draw, Draw+Away
+    et la triple Home+Draw+Away.
+
+    Retourne la meilleure opportunité ou None.
+    """
+    if not odds_row:
+        return None
+
+    odd_h = odds_row.get("odd_home", 0)
+    odd_d = odds_row.get("odd_draw", 0)
+    odd_a = odds_row.get("odd_away", 0)
+
+    candidates = [
+        [{"name": "H", "odd": odd_h, "label": "Domicile"},
+         {"name": "A", "odd": odd_a, "label": "Extérieur"}],
+        [{"name": "H", "odd": odd_h, "label": "Domicile"},
+         {"name": "D", "odd": odd_d, "label": "Nul"}],
+        [{"name": "D", "odd": odd_d, "label": "Nul"},
+         {"name": "A", "odd": odd_a, "label": "Extérieur"}],
+        [{"name": "H", "odd": odd_h, "label": "Domicile"},
+         {"name": "D", "odd": odd_d, "label": "Nul"},
+         {"name": "A", "odd": odd_a, "label": "Extérieur"}],
+    ]
+
+    best = None
+    for combo in candidates:
+        if any(o["odd"] <= 1.0 for o in combo):
+            continue
+        result = dutch_stakes(combo, total_stake)
+        if not result:
+            continue
+        roi = result[0]["dutch_roi"]
+        if roi < min_profit_pct:
+            continue
+        if best is None or roi > best["dutch_roi"]:
+            best = {
+                "outcomes":    result,
+                "dutch_roi":   roi,
+                "dutch_profit": result[0]["dutch_profit"],
+                "total_stake": total_stake,
+                "impl_sum":    round(sum(1 / o["odd"] for o in combo), 4),
+                **match_info,
+            }
+    return best
+
+
+# ════════════════════════════════════════════════════════════
 # SIGNAL FINAL
 # ════════════════════════════════════════════════════════════
 

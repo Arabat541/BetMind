@@ -21,9 +21,9 @@ from data_fetcher import (
     get_fd_quota_used, count_active_bets_for_league, get_team_exposure,
 )
 from feature_engineering import build_football_features, build_nba_features
-from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds
+from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds, build_bhg_signal, fetch_bhg_odds, detect_dutching_opportunity, enrich_signal_with_line_shop
 from bankroll import BankrollTracker, recommended_stake
-from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert
+from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert, send_bhg_alert, send_dutch_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +78,7 @@ def run_football_predictions():
     league_ah_odds_map   = {lg: fetch_football_ah_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
     league_cs_odds_map   = {lg: fetch_correct_score_odds(key) for lg, key in _LEAGUE_KEYS.items()}
     league_open_odds_map = {lg: fetch_opening_odds(key)       for lg, key in _LEAGUE_KEYS.items()}
+    league_bhg_odds_map  = {lg: fetch_bhg_odds(key)           for lg, key in _LEAGUE_KEYS.items()}
 
     signals       = []
     bankroll      = tracker.get_balance()
@@ -159,6 +160,11 @@ def run_football_predictions():
                         f" (max {MAX_TEAM_EXPOSURE_PCT:.0%}). Skip."
                     )
                     continue
+
+            # ── AS — Line shopping multi-bookmakers ──────────────
+            league_api_key = _LEAGUE_KEYS.get(fix["league"], "")
+            if league_api_key:
+                signal = enrich_signal_with_line_shop(signal, league_api_key)
 
             daily_staked += stake_info["stake_amount"]
             signals.append(signal)
@@ -389,6 +395,65 @@ def run_football_predictions():
                             f"score {cs_sig['value_bets'][0]['score']} "
                             f"edge={cs_sig['edge']:.1%} @ {cs_sig['odd_used']:.2f}"
                         )
+
+            # ── AQ — Both Halves Goals ───────────────────────────
+            bhg_odds_all = league_bhg_odds_map.get(fix["league"], {})
+            if bhg_odds_all and daily_staked < daily_limit:
+                bhg_odds_event = {}
+                for event_key, odds in bhg_odds_all.items():
+                    h_part = event_key.split("|")[0] if "|" in event_key else event_key
+                    if fix["home_team"].split()[0].lower() in h_part.lower():
+                        bhg_odds_event = odds
+                        break
+                if bhg_odds_event:
+                    bhg_sig = build_bhg_signal(
+                        features=features,
+                        bhg_odds_row=bhg_odds_event,
+                        match_info={
+                            "league":    fix["league"],
+                            "home_team": fix["home_team"],
+                            "away_team": fix["away_team"],
+                            "match_date": fix.get("date", ""),
+                        }
+                    )
+                    if bhg_sig:
+                        remaining_bhg = daily_limit - daily_staked
+                        bhg_stake = recommended_stake(bhg_sig, bankroll)
+                        if bhg_stake["stake_amount"] > remaining_bhg:
+                            bhg_stake["stake_amount"] = round(remaining_bhg)
+                            bhg_stake["stake_pct"] = round(remaining_bhg / bankroll, 4) if bankroll > 0 else 0
+                        bhg_sig["kelly_stake"]    = bhg_stake["stake_amount"]
+                        bhg_sig["stake_pct"]      = bhg_stake["stake_pct"]
+                        bhg_sig["expected_value"] = bhg_stake.get("expected_value", 0)
+                        bhg_sig["market"]         = "BHG"
+                        daily_staked += bhg_stake["stake_amount"]
+                        signals.append(bhg_sig)
+                        save_prediction(bhg_sig)
+                        send_bhg_alert(bhg_sig, bhg_stake)
+                        logger.info(
+                            f"  [BHG] Value bet: {fix['home_team']} vs {fix['away_team']} "
+                            f"edge={bhg_sig['edge']:.1%} @ {bhg_sig['odd']:.2f}"
+                        )
+
+            # ── AR — Dutching multi-outcomes ─────────────────────
+            dutch_opp = detect_dutching_opportunity(
+                odds_row=odds_row,
+                proba=proba,
+                match_info={
+                    "league":     fix["league"],
+                    "home_team":  fix["home_team"],
+                    "away_team":  fix["away_team"],
+                    "match_date": fix.get("date", ""),
+                },
+                total_stake=bankroll * 0.02,   # 2% bankroll max sur Dutch
+                min_profit_pct=0.02,
+            )
+            if dutch_opp:
+                send_dutch_alert(dutch_opp)
+                logger.info(
+                    f"  [Dutch] {fix['home_team']} vs {fix['away_team']} "
+                    f"ROI={dutch_opp['dutch_roi']:.1%} impl_sum={dutch_opp['impl_sum']}"
+                )
 
             time.sleep(0.2)
 
@@ -1053,6 +1118,27 @@ def run_health_check():
     send_message("\n".join(lines))
 
 
+_STEAM_LEAGUE_KEYS = [
+    "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+]
+
+
+def _run_steam_detection():
+    """Cycle steam move — appelé toutes les 2 minutes par le scheduler (AT)."""
+    from steam_detector import run_steam_monitor_cycle
+    from telegram_bot import send_steam_alert
+    from config import THE_ODDS_API_KEY
+    run_steam_monitor_cycle(_STEAM_LEAGUE_KEYS, api_key=THE_ODDS_API_KEY, alert_fn=send_steam_alert)
+
+
+def _run_account_health():
+    """Vérification quotidienne de la santé des comptes (AU)."""
+    from account_health import run_health_check_accounts
+    from telegram_bot import send_account_health_alert
+    run_health_check_accounts(alert_fn=send_account_health_alert)
+
+
 def start_scheduler():
     logger.info("Scheduler démarré.")
     schedule.every().day.at("07:30").do(run_health_check)      # healthcheck avant cycle
@@ -1064,6 +1150,8 @@ def start_scheduler():
     schedule.every().day.at("10:00").do(check_silence)        # monitoring quotidien
     schedule.every().monday.at("09:00").do(send_weekly_report)
     schedule.every().monday.at("03:00").do(retrain_models)  # 1er lundi du mois seulement
+    schedule.every(2).minutes.do(_run_steam_detection)         # AT — steam move detector
+    schedule.every().day.at("06:00").do(_run_account_health)   # AU — account health check
     while True:
         schedule.run_pending()
         time.sleep(60)

@@ -496,3 +496,119 @@ def send_rlm_alert(home_team: str, away_team: str, league: str,
         "🤖 BetMind Agent"
     ]
     send_message("\n".join(lines))
+
+
+def send_bhg_alert(signal: dict, stake_info: dict):
+    """Alerte Telegram pour un value bet Both Halves Goals (marché AQ)."""
+    lines = [
+        "⏱️ <b>VALUE BET — BOTH HALVES GOALS</b>",
+        "",
+        f"⚽ <b>{signal.get('home_team', '?')} vs {signal.get('away_team', '?')}</b>",
+        f"🏆 {signal.get('league', '')}",
+        f"📅 {signal.get('match_date', '')[:10]}",
+        "",
+        f"<b>Pari :</b> {signal.get('result_name', signal.get('side', '?'))}",
+        f"<b>Proba modèle :</b> {signal.get('prob_model', 0):.1%}",
+        f"<b>Proba implicite :</b> {signal.get('prob_impl', 0):.1%}",
+        f"<b>Edge :</b> +{signal.get('edge', 0):.1%}",
+        f"<b>Cote :</b> {signal.get('odd', 0):.2f}",
+        f"<b>EV :</b> {signal.get('ev', 0):+.3f}",
+    ]
+
+    if stake_info.get("stake_amount", 0) > 0:
+        lines += [
+            "",
+            "💰 <b>Mise recommandée (Kelly) :</b>",
+            f"  • {stake_info['stake_amount']:,.0f} FCFA ({stake_info['stake_pct']:.1%} bankroll)",
+        ]
+
+    lines += [
+        "",
+        "💡 <i>BHG : les deux équipes marquent dans chaque mi-temps.</i>",
+        "─" * 30,
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_dutch_alert(signal: dict):
+    """Alerte Telegram pour une opportunité Dutching (AR)."""
+    outcomes = signal.get("outcomes", [])
+    roi      = signal.get("dutch_roi", 0)
+    profit   = signal.get("dutch_profit", 0)
+    total    = signal.get("total_stake", 0)
+
+    lines = [
+        "🎰 <b>DUTCHING — PROFIT GARANTI</b>",
+        "",
+        f"⚽ <b>{signal.get('home_team', '?')} vs {signal.get('away_team', '?')}</b>",
+        f"🏆 {signal.get('league', '')}",
+        f"📅 {signal.get('match_date', '')[:10]}",
+        "",
+        f"<b>Profit garanti :</b> {profit:,.0f} FCFA (+{roi:.1%} ROI)",
+        f"<b>Mise totale :</b> {total:,.0f} FCFA",
+        f"<b>Somme impl. :</b> {signal.get('impl_sum', 0):.3f} (< 1.0 = edge)",
+        "",
+        "<b>Répartition :</b>",
+    ]
+
+    for o in outcomes:
+        lines.append(
+            f"  • {o['label']:15s} @ {o['odd']:.2f} → {o['dutch_stake']:,.0f} FCFA"
+        )
+
+    lines += [
+        "",
+        "💡 <i>Dutching : mise répartie pour profit identique quel que soit le résultat.</i>",
+        "─" * 30,
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_steam_alert(steam_move: dict):
+    """Alerte Telegram pour un steam move détecté (AT)."""
+    outcome_names = {"H": "Domicile", "D": "Nul", "A": "Extérieur"}
+    direction_symbols = {"down": "⬇️ cote en baisse (signal sharp money)", "up": "⬆️ cote en hausse"}
+    outcome = steam_move.get("outcome", "?")
+    direction = steam_move.get("direction", "down")
+
+    lines = [
+        "🚨 <b>STEAM MOVE DÉTECTÉ</b>",
+        "",
+        f"⚽ <b>{steam_move.get('home_team', '?')} vs {steam_move.get('away_team', '?')}</b>",
+        f"<b>Issue :</b> {outcome_names.get(outcome, outcome)}",
+        f"<b>Direction :</b> {direction_symbols.get(direction, direction)}",
+        f"<b>Variation :</b> {steam_move.get('change_pct', 0):.1%} en {steam_move.get('elapsed_sec', 0)}s",
+        f"<b>Cote moy. avant :</b> {steam_move.get('avg_old_odd', 0):.2f}",
+        f"<b>Cote moy. après :</b> {steam_move.get('avg_new_odd', 0):.2f}",
+        f"<b>Books confirmant :</b> {steam_move.get('books_moved', 0)}",
+        "",
+        "💡 <i>Move simultané sur plusieurs books = argent professionnel.</i>",
+        "─" * 30,
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_account_health_alert(report: dict):
+    """Alerte Telegram pour la santé des comptes bookmakers (AU)."""
+    lines = [
+        "⚠️ <b>COMPTE BOOKMAKER — ALERTE LIMITATION</b>",
+        "",
+        f"<b>Bookmaker :</b> {report.get('bookmaker', '?')}",
+        f"<b>Score santé :</b> {report.get('health_score', 0):.0%}",
+        "",
+        "<b>Indicateurs :</b>",
+    ]
+    for indicator, status in report.get("indicators", {}).items():
+        emoji = "🔴" if status.get("warning") else "🟢"
+        lines.append(f"  {emoji} {indicator}: {status.get('value', 'N/A')}")
+
+    lines += [
+        "",
+        f"<b>Recommandation :</b> {report.get('recommendation', 'Surveiller.')}",
+        "─" * 30,
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))

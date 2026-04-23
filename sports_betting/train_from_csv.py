@@ -15,7 +15,7 @@ import os
 import pickle
 import sys
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from understat_fetcher import load_xg_history, get_team_xg_rolling
 from transfermarkt_fetcher import load_squad_values, get_squad_value_features
@@ -149,6 +149,12 @@ FEATURE_COLS = [
     "home_xg_loss", "away_xg_loss",
     "home_xg_loss_pct", "away_xg_loss_pct",
     "home_top_scorer_share", "away_top_scorer_share",
+    # Fixture congestion précise — AN
+    "home_congestion", "away_congestion",
+    "home_has_europe", "away_has_europe",
+    "home_congestion_score", "away_congestion_score",
+    # Distance déplacement Away — AO
+    "away_travel_km", "away_timezone_diff", "away_travel_score",
 ]
 
 
@@ -584,6 +590,57 @@ def _get_squad_value_features(home: str, away: str,
     return get_squad_value_features(squad_values, home, away)
 
 
+def _get_congestion_features(home: str, away: str,
+                              date: str, dates_dict: dict) -> dict:
+    """
+    Compte les matchs joués par chaque équipe dans les 21 jours avant `date`.
+    Utilise dates_dict (liste ISO dates par équipe, construite depuis les CSVs).
+    has_europe=0 en entraînement (données domestiques uniquement).
+    """
+    _MAX = 7
+    try:
+        before_dt = datetime.strptime(date[:10], "%Y-%m-%d") if isinstance(date, str) \
+                    else date.to_pydatetime().replace(tzinfo=None)
+        cutoff = before_dt - timedelta(days=21)
+
+        def _to_dt(d) -> datetime:
+            if isinstance(d, str):
+                return datetime.strptime(d[:10], "%Y-%m-%d")
+            return d.to_pydatetime().replace(tzinfo=None)
+
+        def _count(team: str) -> int:
+            return sum(
+                1 for d in dates_dict.get(team, [])
+                if cutoff <= _to_dt(d) < before_dt
+            )
+
+        h_cnt = _count(home)
+        a_cnt = _count(away)
+        return {
+            "home_congestion":       h_cnt,
+            "away_congestion":       a_cnt,
+            "home_has_europe":       0.0,
+            "away_has_europe":       0.0,
+            "home_congestion_score": round(min(h_cnt / _MAX, 1.0), 4),
+            "away_congestion_score": round(min(a_cnt / _MAX, 1.0), 4),
+        }
+    except Exception:
+        return {k: 0.0 for k in (
+            "home_congestion", "away_congestion",
+            "home_has_europe", "away_has_europe",
+            "home_congestion_score", "away_congestion_score",
+        )}
+
+
+def _get_travel_features(home: str, away: str) -> dict:
+    """Wrapper autour de travel_distance.build_travel_features avec fallback."""
+    try:
+        from travel_distance import build_travel_features
+        return build_travel_features(home, away)
+    except Exception:
+        return {"away_travel_km": 0.0, "away_timezone_diff": 0.0, "away_travel_score": 0.0}
+
+
 def build_row_features(row: pd.Series,
                        history: dict, dates_dict: dict,
                        h2h_db: dict,
@@ -740,6 +797,10 @@ def build_row_features(row: pd.Series,
         **_get_xg_features(home, away, date, xg_history),
         # Valeur marchande effectifs — Y
         **_get_squad_value_features(home, away, squad_values),
+        # Fixture congestion — AN
+        **_get_congestion_features(home, away, date, dates_dict),
+        # Distance déplacement Away — AO
+        **_get_travel_features(home, away),
     }
 
 

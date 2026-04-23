@@ -1477,6 +1477,17 @@ def api_xg_squad():
     return jsonify({"xg": xg_rows, "squad": sq_rows})
 
 
+@app.route("/api/account_health")
+def api_account_health():
+    """AU — Score de santé du compte bookmaker."""
+    try:
+        from account_health import compute_account_health
+        report = compute_account_health("all", lookback_days=14)
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({"health_score": 1.0, "error": str(e)})
+
+
 if __name__ == "__main__":
     from data_fetcher import init_db
     init_db()

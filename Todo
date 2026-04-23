@@ -104,15 +104,14 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
   fetch_opening_odds() via The Odds API (Pinnacle/Betfair/Unibet)
   RLM enrichit le signal principal + send_rlm_alert() pour score ≥ 0.60
 
-### AN — Fixture congestion précise
-  Nombre de matchs sur 21 jours + probabilité de rotation
-  Plus précis que la fatigue actuelle (basée sur les jours uniquement)
-  Intégrer les compétitions européennes (Champions League, Europa)
+### ✅ AN — Fixture congestion précise — FAIT
+  fixture_congestion.py — count_matches_in_window() depuis xG Understat + detect_european_fixture() via The Odds API
+  home/away_congestion (count 21j) + home/away_has_europe + home/away_congestion_score [0-1] dans FEATURE_COLS
+  Train: calculé depuis dates_dict CSV (pas d'API) — Live: Understat + The Odds API UCL/UEL/UECL
 
-### AO — Distance déplacement Away
-  Kilomètres parcourus + décalage horaire pour les matchs européens
-  Home advantage ajusté selon capacité du stade (stade plein vs vide)
-  Source : géocodage des stades + données affluence
+### ✅ AO — Distance déplacement Away — FAIT
+  travel_distance.py — haversine + 200 stades top 5 ligues — away_travel_km/timezone_diff/travel_score
+  Fallback 0.0 si équipe inconnue — stadiums.json extensible — 3 features dans FEATURE_COLS
 
 ### AP — Sentiment NLP (rumeurs blessures)
   Scraping Twitter / Sky Sports / L'Équipe avant publication officielle
@@ -122,30 +121,30 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
 
 ## 🟡 Priorité 3 — Stratégie & marchés
 
-### AQ — Marché Both Halves Goals
-  Les deux équipes marquent dans chaque mi-temps
-  Marché peu modélisé → edge potentiellement élevé
-  Extension naturelle du modèle BTTS existant
+### ✅ AQ — Marché Both Halves Goals — FAIT
+  _bhg_probability() — Poisson bivarié par mi-temps (ratio 50/50 configurable)
+  build_bhg_signal() + fetch_bhg_odds() dans model.py — BHG_EDGE_MIN=10%, BHG_MIN_PROB=15%
+  send_bhg_alert() dans telegram_bot.py + intégré dans predictor.py (league_bhg_odds_map)
 
-### AR — Dutching multi-outcomes
-  Répartir la mise sur plusieurs outcomes pour profit garanti
-  Calcul automatique des mises quand somme des probabilités > 1
-  Intégration dans predictor.py après détection d'opportunité
+### ✅ AR — Dutching multi-outcomes — FAIT
+  dutch_stakes() + detect_dutching_opportunity() dans model.py — impl_sum < 1 → opportunité
+  Couvre H+A, H+D, D+A et H+D+A — mises proportionnelles pour retour équalisé
+  send_dutch_alert() dans telegram_bot.py + intégré dans predictor.py (2% bankroll max)
 
-### AS — Line shopping multi-bookmakers
-  Comparer 5+ bookmakers via The Odds API pour prendre la meilleure cote
-  Sauvegarder best_odd_available vs odd_used dans DB
-  Impact direct sur le ROI sans changer le modèle
+### ✅ AS — Line shopping multi-bookmakers — FAIT
+  get_best_odds() + enrich_signal_with_line_shop() dans model.py — eu+uk+us regions
+  Ajoute best_odd_available, best_book, line_shop_gain dans chaque signal
+  Log INFO si meilleure cote disponible > cote utilisée + 0.05 — enrich avant save_prediction()
 
 
 ## 🟢 Priorité 4 — Infrastructure sharp
 
-### AT — Steam move detector
-  Variation de cote > 5% en < 3 minutes sur plusieurs books = sharp money
-  WebSocket vers The Odds API (latence < 1s) remplace le polling actuel
-  Alerte Telegram immédiate + flag dans la prédiction concernée
+### ✅ AT — Steam move detector — FAIT
+  steam_detector.py — polling 60s The Odds API, snapshots mémoire, seuil ≥5% sur ≥2 books
+  run_steam_monitor_cycle() + detect_steam_moves() — schedule.every(2).minutes dans predictor.py
+  send_steam_alert() dans telegram_bot.py — alerte immédiate si steam confirmé
 
-### AU — Account health scoring
-  Détecter si un compte bookmaker est en cours de limitation
-  Métriques : délai de confirmation, plafond de mise accepté, oddss refusés
-  Alerte automatique + rotation vers un autre compte
+### ✅ AU — Account health scoring — FAIT
+  account_health.py — compute_account_health() : stake shrink, EV dégradé, taux EV négatif
+  Score [0,1] — alerte Telegram si score < 50% — send_account_health_alert()
+  /api/account_health dans dashboard.py + schedule.every().day.at("06:00") dans predictor.py
