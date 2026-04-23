@@ -17,8 +17,17 @@ from db import get_conn, raw_conn, ph as _ph, is_postgres
 
 def _sanitize_nan(obj):
     """Remplace récursivement NaN/Inf par None pour un JSON valide."""
+    import decimal
     if isinstance(obj, float):
         return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, decimal.Decimal):
+        try:
+            f = float(obj)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+        except Exception:
+            return None
+    if isinstance(obj, str) and obj.lower() in ("nan", "inf", "-inf", "infinity"):
+        return None
     if isinstance(obj, dict):
         return {k: _sanitize_nan(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -876,7 +885,8 @@ function buildConfRoiChart(data) {
             label: ctx => {
               const d = data[ctx.dataIndex];
               const s = ctx.parsed.y >= 0 ? '+' : '';
-              return [`ROI : ${s}${ctx.parsed.y.toFixed(2)}%`, `${d.bets} paris | ${d.wins}W (${d.win_rate}%) | P&L ${d.pnl >= 0 ? '+' : ''}${d.pnl.toLocaleString('fr-FR')} FCFA`];
+              const dp = (d.pnl != null && !Number.isNaN(Number(d.pnl))) ? Number(d.pnl) : 0;
+              return [`ROI : ${s}${ctx.parsed.y.toFixed(2)}%`, `${d.bets} paris | ${d.wins}W (${d.win_rate}%) | P&L ${dp >= 0 ? '+' : ''}${dp.toLocaleString('fr-FR')} FCFA`];
             }
           }
         }
@@ -911,7 +921,8 @@ function buildLeagueChart(data) {
             label: ctx => {
               const r = sorted[ctx.dataIndex];
               const s = ctx.parsed.x >= 0 ? '+' : '';
-              return [`ROI : ${s}${ctx.parsed.x.toFixed(2)}%`, `${r.bets} paris | ${r.wins}W (${r.win_rate}%) | P&L ${r.pnl >= 0 ? '+' : ''}${r.pnl.toLocaleString('fr-FR')} FCFA`];
+              const rp = (r.pnl != null && !Number.isNaN(Number(r.pnl))) ? Number(r.pnl) : 0;
+              return [`ROI : ${s}${ctx.parsed.x.toFixed(2)}%`, `${r.bets} paris | ${r.wins}W (${r.win_rate}%) | P&L ${rp >= 0 ? '+' : ''}${rp.toLocaleString('fr-FR')} FCFA`];
             }
           }
         }
@@ -939,16 +950,17 @@ function buildRoiTable(data) {
   const tbody = document.getElementById('roi-tbody');
   if (!data.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);text-align:center">Aucun pari réglé</td></tr>'; return; }
   tbody.innerHTML = data.map(r => {
-    const roiColor = r.roi >= 0 ? 'var(--green)' : 'var(--red)';
-    const pnlColor = r.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const roiColor = (r.roi || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnl      = (r.pnl != null && !Number.isNaN(Number(r.pnl))) ? Number(r.pnl) : 0;
+    const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
     return `<tr>
       <td><b>${r.league}</b></td>
       <td>${r.sport === 'football' ? '⚽' : '🏀'}</td>
       <td style="font-family:'JetBrains Mono'">${r.bets}</td>
       <td style="font-family:'JetBrains Mono'">${r.wins}</td>
       <td style="font-family:'JetBrains Mono';color:var(--gold)">${r.win_rate}%</td>
-      <td style="font-family:'JetBrains Mono';color:${pnlColor}">${r.pnl >= 0 ? '+' : ''}${r.pnl.toLocaleString('fr-FR')}</td>
-      <td style="font-family:'JetBrains Mono';color:${roiColor};font-weight:700">${r.roi >= 0 ? '+' : ''}${r.roi}%</td>
+      <td style="font-family:'JetBrains Mono';color:${pnlColor}">${pnl >= 0 ? '+' : ''}${pnl.toLocaleString('fr-FR')}</td>
+      <td style="font-family:'JetBrains Mono';color:${roiColor};font-weight:700">${(r.roi||0) >= 0 ? '+' : ''}${r.roi||0}%</td>
     </tr>`;
   }).join('');
 }
@@ -958,15 +970,16 @@ function buildMarketTable(data) {
   if (!data.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center">Aucun paris réglé</td></tr>'; return; }
   const MARKET_LABELS = { '1X2': '⚽ 1X2', 'OU_2.5': '⚖️ O/U 2.5', 'BTTS': '🎯 BTTS', 'AH_-0.5': '🔰 AH -0.5' };
   tbody.innerHTML = data.map(r => {
-    const roiColor = r.roi >= 0 ? 'var(--green)' : 'var(--red)';
-    const pnlColor = r.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const roiColor = (r.roi || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnl      = (r.pnl != null && !Number.isNaN(Number(r.pnl))) ? Number(r.pnl) : 0;
+    const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
     return `<tr>
       <td><b>${MARKET_LABELS[r.market] || r.market}</b></td>
       <td style="font-family:'JetBrains Mono'">${r.bets}</td>
       <td style="font-family:'JetBrains Mono'">${r.wins}</td>
       <td style="font-family:'JetBrains Mono';color:var(--gold)">${r.win_rate}%</td>
-      <td style="font-family:'JetBrains Mono';color:${pnlColor}">${r.pnl >= 0 ? '+' : ''}${r.pnl.toLocaleString('fr-FR')}</td>
-      <td style="font-family:'JetBrains Mono';color:${roiColor};font-weight:700">${r.roi >= 0 ? '+' : ''}${r.roi}%</td>
+      <td style="font-family:'JetBrains Mono';color:${pnlColor}">${pnl >= 0 ? '+' : ''}${pnl.toLocaleString('fr-FR')}</td>
+      <td style="font-family:'JetBrains Mono';color:${roiColor};font-weight:700">${(r.roi||0) >= 0 ? '+' : ''}${r.roi||0}%</td>
     </tr>`;
   }).join('');
 }
@@ -1000,8 +1013,9 @@ function buildTable(preds) {
     const ph  = Math.round(p.prob_home * 100);
     const pd_ = Math.round((p.prob_draw || 0) * 100);
     const pa  = Math.round(p.prob_away * 100);
-    const pnlStr = p.pnl != null
-      ? `<span style="color:${p.pnl >= 0 ? 'var(--green)' : 'var(--red)'}; font-family:'JetBrains Mono'; font-size:12px;">${p.pnl >= 0 ? '+' : ''}${p.pnl.toLocaleString('fr-FR')}</span>`
+    const pnlVal = (p.pnl != null && !Number.isNaN(Number(p.pnl))) ? Number(p.pnl) : null;
+    const pnlStr = pnlVal != null
+      ? `<span style="color:${pnlVal >= 0 ? 'var(--green)' : 'var(--red)'}; font-family:'JetBrains Mono'; font-size:12px;">${pnlVal >= 0 ? '+' : ''}${pnlVal.toLocaleString('fr-FR')}</span>`
       : '<span style="color:var(--muted)">—</span>';
 
     // Outcome badge: check if correct prediction for any market
@@ -1086,7 +1100,7 @@ async function runBacktest() {
       <div class="sharp-lbl">ROI période</div>
     </div>
     <div class="sharp-card">
-      <div class="sharp-val" style="color:${kpiColor(data.pnl)};font-size:20px">${data.pnl >= 0 ? '+' : ''}${(data.pnl||0).toLocaleString('fr-FR')}</div>
+      <div class="sharp-val" style="color:${kpiColor(data.pnl)};font-size:20px">${(data.pnl||0) >= 0 ? '+' : ''}${(data.pnl||0).toLocaleString('fr-FR')}</div>
       <div class="sharp-lbl">P&L (FCFA)</div>
     </div>
     <div class="sharp-card">
@@ -1161,12 +1175,7 @@ def api_predictions():
         return jsonify([])
     df = df.where(df.notna(), other=None)
     records = df.to_dict(orient="records")
-    def clean(v):
-        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-            return None
-        return v
-    records = [{k: clean(v) for k, v in row.items()} for row in records]
-    return jsonify(records)
+    return jsonify([{k: _sanitize_nan(v) for k, v in row.items()} for row in records])
 
 
 @app.route("/api/stats")
