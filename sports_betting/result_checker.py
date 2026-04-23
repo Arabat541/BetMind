@@ -2,12 +2,11 @@
 # result_checker.py — Vérification automatique des résultats
 # ============================================================
 
-import sqlite3
 import logging
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,6 +15,7 @@ from config import FOOTBALL_DATA_KEY, FOOTBALL_DATA_BASE, DB_PATH, BALLDONTLIE_K
 from data_fetcher import _http_get_with_retry
 from bankroll import BankrollTracker
 from telegram_bot import send_message, send_model_drift_alert
+from db import get_conn, raw_conn, ph as _ph, is_postgres
 
 logger  = logging.getLogger(__name__)
 tracker = BankrollTracker()
@@ -261,10 +261,8 @@ def settle_prediction(pred_id: int, outcome: str, pred_result: str,
     odd   = odd_used or 1.0
     pnl   = round(stake * (odd - 1), 0) if (won and stake > 0 and odd > 1) else (-stake if stake > 0 else 0.0)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE predictions SET outcome=?, pnl=? WHERE id=?", (outcome, pnl, pred_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.execute(f"UPDATE predictions SET outcome={_ph}, pnl={_ph} WHERE id={_ph}", (outcome, pnl, pred_id))
 
     if stake > 0:
         tracker.settle_bet(pred_id, outcome)
@@ -306,14 +304,13 @@ def _check_model_drift(n: int = 20):
     envoie une alerte Telegram de dérive du modèle.
     Appelé après chaque batch de résultats réglés.
     """
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT pnl FROM predictions
-        WHERE outcome IS NOT NULL AND kelly_stake > 0
-        ORDER BY match_date DESC
-        LIMIT ?
-    """, (n,)).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(f"""
+            SELECT pnl FROM predictions
+            WHERE outcome IS NOT NULL AND kelly_stake > 0
+            ORDER BY match_date DESC
+            LIMIT {_ph}
+        """, (n,)).fetchall()
 
     if len(rows) < n:
         return  # pas encore assez d'historique
@@ -337,14 +334,13 @@ def run_result_checker():
     """
     logger.info("═══ RESULT CHECKER ═══")
 
-    conn = sqlite3.connect(DB_PATH)
-    pending = pd.read_sql_query("""
-        SELECT * FROM predictions
-        WHERE outcome IS NULL
-        AND match_date IS NOT NULL
-        AND DATE(match_date) <= date('now', '-1 day')
-        ORDER BY match_date ASC
-    """, conn)
+    cutoff = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    _rc_ph = "%s" if is_postgres() else "?"
+    conn = raw_conn()
+    pending = pd.read_sql_query(
+        f"SELECT * FROM predictions WHERE outcome IS NULL AND match_date IS NOT NULL AND match_date <= {_rc_ph} ORDER BY match_date ASC",
+        conn, params=(cutoff,)
+    )
     conn.close()
 
     if pending.empty:

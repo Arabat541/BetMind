@@ -5,11 +5,12 @@
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from data_fetcher import get_all_predictions
 from bankroll import BankrollTracker
 from config import FLASK_PORT, FLASK_DEBUG
+from db import get_conn, raw_conn, ph as _ph, is_postgres
 
 app = Flask(__name__)
 tracker = BankrollTracker()
@@ -1158,21 +1159,19 @@ def api_stats():
 
 @app.route("/api/roi_by_league")
 def api_roi_by_league():
-    import math, sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT league, sport,
-               COUNT(*) as bets,
-               SUM(CASE WHEN pred_result = outcome THEN 1 ELSE 0 END) as wins,
-               SUM(COALESCE(pnl, 0))  as pnl,
-               SUM(COALESCE(kelly_stake, 0)) as staked
-        FROM predictions
-        WHERE outcome IS NOT NULL AND kelly_stake > 0
-        GROUP BY league, sport
-        ORDER BY pnl DESC
-    """).fetchall()
-    conn.close()
+    import math
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT league, sport,
+                   COUNT(*) as bets,
+                   SUM(CASE WHEN pred_result = outcome THEN 1 ELSE 0 END) as wins,
+                   SUM(COALESCE(pnl, 0))  as pnl,
+                   SUM(COALESCE(kelly_stake, 0)) as staked
+            FROM predictions
+            WHERE outcome IS NOT NULL AND kelly_stake > 0
+            GROUP BY league, sport
+            ORDER BY pnl DESC
+        """).fetchall()
     result = []
     for league, sport, bets, wins, pnl, staked in rows:
         roi = (pnl / staked * 100) if staked else 0.0
@@ -1190,13 +1189,11 @@ def api_roi_by_league():
 
 @app.route("/api/bankroll_history")
 def api_bankroll_history():
-    import sqlite3
-    from config import DB_PATH, INITIAL_BANKROLL
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT updated_at, balance FROM bankroll ORDER BY id ASC"
-    ).fetchall()
-    conn.close()
+    from config import INITIAL_BANKROLL
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT updated_at, balance FROM bankroll ORDER BY id ASC"
+        ).fetchall()
     data = [{"date": r[0][:10] if r[0] else "", "balance": r[1]} for r in rows]
     if not data:
         from datetime import date
@@ -1206,14 +1203,13 @@ def api_bankroll_history():
 
 @app.route("/api/daily_exposure")
 def api_daily_exposure():
-    import sqlite3
-    from config import DB_PATH, MAX_DAILY_STAKE_PCT
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("""
-        SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
-        WHERE DATE(created_at) = date('now') AND kelly_stake > 0
-    """).fetchone()
-    conn.close()
+    from config import MAX_DAILY_STAKE_PCT
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        row = conn.execute(f"""
+            SELECT COALESCE(SUM(kelly_stake), 0) FROM predictions
+            WHERE DATE(created_at) = {_ph} AND kelly_stake > 0
+        """, (today,)).fetchone()
     staked_today = float(row[0]) if row else 0.0
     bankroll     = tracker.get_balance()
     daily_limit  = bankroll * MAX_DAILY_STAKE_PCT
@@ -1248,21 +1244,19 @@ def api_models_status():
 @app.route("/api/market_stats")
 def api_market_stats():
     """Statistiques (bets, win rate, ROI) par marché."""
-    import math, sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT COALESCE(market, '1X2') as market,
-               COUNT(*) as bets,
-               SUM(CASE WHEN pred_result = outcome THEN 1 ELSE 0 END) as wins,
-               SUM(COALESCE(pnl, 0)) as pnl,
-               SUM(COALESCE(kelly_stake, 0)) as staked
-        FROM predictions
-        WHERE kelly_stake > 0
-        GROUP BY COALESCE(market, '1X2')
-        ORDER BY bets DESC
-    """).fetchall()
-    conn.close()
+    import math
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(market, '1X2') as market,
+                   COUNT(*) as bets,
+                   SUM(CASE WHEN pred_result = outcome THEN 1 ELSE 0 END) as wins,
+                   SUM(COALESCE(pnl, 0)) as pnl,
+                   SUM(COALESCE(kelly_stake, 0)) as staked
+            FROM predictions
+            WHERE kelly_stake > 0
+            GROUP BY COALESCE(market, '1X2')
+            ORDER BY bets DESC
+        """).fetchall()
     result = []
     for market, bets, wins, pnl, staked in rows:
         wins = int(wins or 0)
@@ -1284,15 +1278,12 @@ def api_market_stats():
 def api_brier_score():
     """Brier Score sur tous les paris réglés (calibration du modèle).
     BS = mean((confidence - correct)^2). Meilleur score proche de 0."""
-    import sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT confidence, pred_result, outcome
-        FROM predictions
-        WHERE outcome IS NOT NULL AND confidence IS NOT NULL
-    """).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT confidence, pred_result, outcome
+            FROM predictions
+            WHERE outcome IS NOT NULL AND confidence IS NOT NULL
+        """).fetchall()
     if not rows:
         return jsonify({"brier_score": None, "n": 0})
     total = sum(
@@ -1317,15 +1308,12 @@ def api_sharp_money():
     """Statistiques de mouvement de cotes depuis l'ouverture.
     Positif = cote a baissé depuis nous (sharps confirment notre pari).
     Négatif = cote a monté (marché contre nous → paris annulé)."""
-    import sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT opening_movement_pct
-        FROM predictions
-        WHERE opening_movement_pct IS NOT NULL
-    """).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT opening_movement_pct
+            FROM predictions
+            WHERE opening_movement_pct IS NOT NULL
+        """).fetchall()
     if not rows:
         return jsonify({"confirmed": 0, "cancelled": 0, "neutral": 0, "avg_movement": 0.0})
     movements = [r[0] for r in rows]
@@ -1358,39 +1346,37 @@ def api_backtest():
 
     where  = ["outcome IS NOT NULL", "kelly_stake > 0"]
     params = []
-    where.append("DATE(match_date) >= ?"); params.append(date_from)
-    where.append("DATE(match_date) <= ?"); params.append(date_to)
+    where.append(f"match_date >= {_ph}"); params.append(date_from)
+    where.append(f"match_date <= {_ph}"); params.append(date_to)
     if sport:
-        where.append("sport = ?"); params.append(sport)
+        where.append(f"sport = {_ph}"); params.append(sport)
     if market:
-        where.append("COALESCE(market,'1X2') = ?"); params.append(market)
+        where.append(f"COALESCE(market,'1X2') = {_ph}"); params.append(market)
 
     sql_where = " AND ".join(where)
 
-    conn = sqlite3.connect(DB_PATH)
+    with get_conn() as conn:
+        # Agrégat global
+        agg = conn.execute(f"""
+            SELECT COUNT(*) AS bets,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   COALESCE(SUM(pnl), 0) AS pnl,
+                   COALESCE(SUM(kelly_stake), 0) AS staked,
+                   AVG(
+                     (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
+                     (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
+                   ) AS brier
+            FROM predictions WHERE {sql_where}
+        """, params).fetchone()
 
-    # Agrégat global
-    agg = conn.execute(f"""
-        SELECT COUNT(*) AS bets,
-               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
-               COALESCE(SUM(pnl), 0) AS pnl,
-               COALESCE(SUM(kelly_stake), 0) AS staked,
-               AVG(
-                 (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END) *
-                 (confidence - CASE WHEN pred_result = outcome THEN 1.0 ELSE 0.0 END)
-               ) AS brier
-        FROM predictions WHERE {sql_where}
-    """, params).fetchone()
-
-    # Courbe P&L par date
-    curve_rows = conn.execute(f"""
-        SELECT DATE(match_date) AS d, SUM(pnl) AS daily_pnl
-        FROM predictions
-        WHERE {sql_where}
-        GROUP BY DATE(match_date)
-        ORDER BY DATE(match_date)
-    """, params).fetchall()
-    conn.close()
+        # Courbe P&L par date
+        curve_rows = conn.execute(f"""
+            SELECT DATE(match_date) AS d, SUM(pnl) AS daily_pnl
+            FROM predictions
+            WHERE {sql_where}
+            GROUP BY DATE(match_date)
+            ORDER BY DATE(match_date)
+        """, params).fetchall()
 
     bets, wins, pnl, staked, brier = agg
     bets   = int(bets or 0)

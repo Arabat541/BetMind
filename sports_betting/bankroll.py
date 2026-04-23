@@ -5,11 +5,11 @@
 import logging
 import sqlite3
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import (
     KELLY_FRACTION, KELLY_FRACTION_DRAW, MAX_BET_PCT, INITIAL_BANKROLL, DB_PATH
 )
-from db import get_conn, raw_conn, ph as _ph
+from db import get_conn, raw_conn, ph as _ph, is_postgres
 
 logger = logging.getLogger(__name__)
 
@@ -339,23 +339,24 @@ class BankrollTracker:
         P&L total des paris réglés sur les N derniers jours de matchs.
         Utilisé par le stop-loss journalier.
         """
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         with get_conn() as conn:
             row = conn.execute(f"""
                 SELECT COALESCE(SUM(pnl), 0) FROM predictions
                 WHERE outcome IS NOT NULL
-                  AND DATE(match_date) >= date('now', {_ph})
-            """, (f"-{days} days",)).fetchone()
+                  AND match_date >= {_ph}
+            """, (cutoff,)).fetchone()
         return float(row[0]) if row else 0.0
 
     def get_weekly_stats(self) -> dict:
         """Stats des paris réglés sur les 7 derniers jours."""
+        cutoff_week = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        _week_ph = "%s" if is_postgres() else "?"
         conn = raw_conn()
-        df   = pd.read_sql_query("""
-            SELECT * FROM predictions
-            WHERE outcome IS NOT NULL
-              AND DATE(match_date) >= date('now', '-7 days')
-            ORDER BY match_date ASC
-        """, conn)
+        df   = pd.read_sql_query(
+            f"SELECT * FROM predictions WHERE outcome IS NOT NULL AND match_date >= {_week_ph} ORDER BY match_date ASC",
+            conn, params=(cutoff_week,)
+        )
         conn.close()
 
         if df.empty:

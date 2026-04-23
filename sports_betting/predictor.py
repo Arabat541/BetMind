@@ -12,6 +12,7 @@ import schedule
 from datetime import datetime, timedelta
 
 from config import FOOTBALL_LEAGUES, CONFIDENCE_THRESHOLD, LOW_BANKROLL_THRESHOLD, ALERT_MIN_EDGE, FD_DAILY_LIMIT, MAX_DAILY_STAKE_PCT, DAILY_STOP_LOSS_PCT, ODDS_MOVEMENT_THRESHOLD, MAX_ACTIVE_BETS_PER_LEAGUE, MAX_TEAM_EXPOSURE_PCT
+from db import get_conn, ph as _pred_ph
 from data_fetcher import (
     init_db, fetch_upcoming_football_fixtures,
     fetch_upcoming_nba_games, fetch_football_odds, fetch_football_ou_odds,
@@ -611,18 +612,15 @@ def check_odds_movement():
     Si oui : annule la mise (kelly_stake = 0) + alerte Telegram.
     Signal de "sharp money" : le marché s'est retourné contre notre prédiction.
     """
-    import sqlite3
-    from config import DB_PATH
-
-    conn  = sqlite3.connect(DB_PATH)
-    rows  = conn.execute("""
-        SELECT id, sport, league, home_team, away_team, pred_result, odd_used, kelly_stake
-        FROM predictions
-        WHERE outcome IS NULL
-          AND kelly_stake > 0
-          AND datetime(created_at) >= datetime('now', '-24 hours')
-    """).fetchall()
-    conn.close()
+    cutoff_24h = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as _om_conn:
+        rows = _om_conn.execute(f"""
+            SELECT id, sport, league, home_team, away_team, pred_result, odd_used, kelly_stake
+            FROM predictions
+            WHERE outcome IS NULL
+              AND kelly_stake > 0
+              AND created_at >= {_pred_ph}
+        """, (cutoff_24h,)).fetchall()
 
     if not rows:
         return
@@ -683,25 +681,20 @@ def check_odds_movement():
             movement_pct = round((saved - current_f) / saved, 4)
             drop_pct     = -movement_pct if movement_pct < 0 else movement_pct
 
-            conn = sqlite3.connect(DB_PATH)
             try:
-                if movement_pct < -ODDS_MOVEMENT_THRESHOLD:
-                    # Cote montée > seuil : marché retourné contre nous → annuler
-                    conn.execute(
-                        "UPDATE predictions SET odd_closing=?, kelly_stake=0, opening_movement_pct=? WHERE id=?",
-                        (current_f, movement_pct, int(pred["id"]))
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE predictions SET odd_closing=?, opening_movement_pct=? WHERE id=?",
-                        (current_f, movement_pct, int(pred["id"]))
-                    )
-                conn.commit()
+                with get_conn() as _upd_conn:
+                    if movement_pct < -ODDS_MOVEMENT_THRESHOLD:
+                        _upd_conn.execute(
+                            f"UPDATE predictions SET odd_closing={_pred_ph}, kelly_stake=0, opening_movement_pct={_pred_ph} WHERE id={_pred_ph}",
+                            (current_f, movement_pct, int(pred["id"]))
+                        )
+                    else:
+                        _upd_conn.execute(
+                            f"UPDATE predictions SET odd_closing={_pred_ph}, opening_movement_pct={_pred_ph} WHERE id={_pred_ph}",
+                            (current_f, movement_pct, int(pred["id"]))
+                        )
             except Exception as db_err:
-                conn.rollback()
                 logger.error(f"check_odds_movement DB error: {db_err}")
-            finally:
-                conn.close()
 
             if movement_pct < -ODDS_MOVEMENT_THRESHOLD:
                 # Marché contre nous : annuler
@@ -968,14 +961,9 @@ def backup_database():
 
 def check_silence():
     """Alerte Telegram si aucune prédiction n'a été faite depuis 24h."""
-    import sqlite3
-    from config import DB_PATH
     try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("""
-            SELECT MAX(created_at) FROM predictions
-        """).fetchone()
-        conn.close()
+        with get_conn() as _sl_conn:
+            row = _sl_conn.execute("SELECT MAX(created_at) FROM predictions").fetchone()
         last_str = row[0] if row and row[0] else None
         if last_str is None:
             return
@@ -1015,11 +1003,10 @@ def run_health_check():
 
     # 2. DB accessible + cohérente
     try:
-        conn = sqlite3.connect(DB_PATH)
-        bad  = conn.execute(
-            "SELECT COUNT(*) FROM predictions WHERE kelly_stake IS NULL AND outcome IS NULL"
-        ).fetchone()[0]
-        conn.close()
+        with get_conn() as _hc_conn:
+            bad = _hc_conn.execute(
+                "SELECT COUNT(*) FROM predictions WHERE kelly_stake IS NULL AND outcome IS NULL"
+            ).fetchone()[0]
         if bad > 0:
             problems.append(f"DB incohérente : {bad} prédiction(s) avec kelly_stake NULL")
     except Exception as e:
