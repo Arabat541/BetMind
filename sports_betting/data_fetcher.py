@@ -893,11 +893,14 @@ def count_active_bets_for_league(league: str) -> int:
 
 
 def get_all_predictions() -> pd.DataFrame:
-    from db import raw_conn
-    conn = raw_conn()
-    df = pd.read_sql_query("SELECT * FROM predictions ORDER BY created_at DESC", conn)
-    conn.close()
-    return df
+    from db import get_conn
+    with get_conn() as conn:
+        cur  = conn.execute("SELECT * FROM predictions ORDER BY created_at DESC")
+        cols = [d[0] for d in cur.description] if cur.description else None
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=cols or [])
+    return pd.DataFrame(rows, columns=cols)
 
 
 def is_already_predicted(home_team: str, away_team: str, match_date: str) -> bool:

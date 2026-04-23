@@ -239,10 +239,12 @@ class BankrollTracker:
 
     def _get_settled_bets(self) -> pd.DataFrame:
         with get_conn() as conn:
-            rows = conn.execute("SELECT * FROM predictions WHERE outcome IS NOT NULL").fetchall()
+            cur  = conn.execute("SELECT * FROM predictions WHERE outcome IS NOT NULL")
+            cols = [d[0] for d in cur.description] if cur.description else None
+            rows = cur.fetchall()
         if not rows:
-            return pd.DataFrame()
-        return pd.DataFrame(rows)
+            return pd.DataFrame(columns=cols or [])
+        return pd.DataFrame(rows, columns=cols)
 
     def get_roi_by_confidence(self) -> list:
         """
@@ -358,26 +360,16 @@ class BankrollTracker:
         """Stats des paris réglés sur les 7 derniers jours."""
         cutoff_week = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         with get_conn() as conn:
-            rows = conn.execute(f"""
+            cur = conn.execute(f"""
                 SELECT * FROM predictions
                 WHERE outcome IS NOT NULL AND match_date >= {_ph}
                 ORDER BY match_date ASC
-            """, (cutoff_week,)).fetchall()
+            """, (cutoff_week,))
+            cols = [d[0] for d in cur.description] if cur.description else None
+            rows = cur.fetchall()
         if not rows:
             return {}
-        # Colonnes attendues par le reste de la fonction
-        col_names = [
-            "id", "sport", "league", "home_team", "away_team", "match_date",
-            "pred_result", "pred_name", "confidence", "is_value_bet",
-            "kelly_stake", "stake_pct", "expected_value", "odd_used",
-            "odd_closing", "opening_movement_pct", "outcome", "pnl",
-            "created_at", "market",
-        ]
-        try:
-            df = pd.DataFrame(rows, columns=col_names[:len(rows[0])])
-        except Exception:
-            # fallback si le schéma ne correspond pas exactement
-            df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows, columns=cols)
 
         if df.empty:
             return {}
