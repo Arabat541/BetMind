@@ -113,10 +113,10 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
   travel_distance.py — haversine + 200 stades top 5 ligues — away_travel_km/timezone_diff/travel_score
   Fallback 0.0 si équipe inconnue — stadiums.json extensible — 3 features dans FEATURE_COLS
 
-### AP — Sentiment NLP (rumeurs blessures)
-  Scraping Twitter / Sky Sports / L'Équipe avant publication officielle
-  Détection de mots-clés : "doubtful", "injury", "out", "ruled out"
-  TTL court (1h) — signal très temporel
+### ✅ AP — Sentiment NLP (rumeurs blessures) — FAIT
+  sentiment_fetcher.py — RSS BBC/Sky Sports/Guardian/RMC — aucune clé API
+  Patterns NLP : OUT (-1.0) / DOUBTFUL (-0.5) / RETURN (+0.5) — cache TTL=1h
+  4 features ML + alerte Telegram si injury_count ≥ 2 — /api/injury_news?team=X dashboard
 
 
 ## 🟡 Priorité 3 — Stratégie & marchés
