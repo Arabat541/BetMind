@@ -238,10 +238,11 @@ class BankrollTracker:
             raise
 
     def _get_settled_bets(self) -> pd.DataFrame:
-        conn = raw_conn()
-        df = pd.read_sql_query("SELECT * FROM predictions WHERE outcome IS NOT NULL", conn)
-        conn.close()
-        return df
+        with get_conn() as conn:
+            rows = conn.execute("SELECT * FROM predictions WHERE outcome IS NOT NULL").fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
 
     def get_roi_by_confidence(self) -> list:
         """
@@ -342,22 +343,41 @@ class BankrollTracker:
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         with get_conn() as conn:
             row = conn.execute(f"""
-                SELECT COALESCE(SUM(pnl), 0) FROM predictions
+                SELECT COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END), 0)
+                FROM predictions
                 WHERE outcome IS NOT NULL
                   AND match_date >= {_ph}
             """, (cutoff,)).fetchone()
-        return float(row[0]) if row else 0.0
+        try:
+            val = float(row[0]) if row else 0.0
+            return val if val == val else 0.0   # NaN guard
+        except (TypeError, ValueError):
+            return 0.0
 
     def get_weekly_stats(self) -> dict:
         """Stats des paris réglés sur les 7 derniers jours."""
         cutoff_week = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        _week_ph = "%s" if is_postgres() else "?"
-        conn = raw_conn()
-        df   = pd.read_sql_query(
-            f"SELECT * FROM predictions WHERE outcome IS NOT NULL AND match_date >= {_week_ph} ORDER BY match_date ASC",
-            conn, params=(cutoff_week,)
-        )
-        conn.close()
+        with get_conn() as conn:
+            rows = conn.execute(f"""
+                SELECT * FROM predictions
+                WHERE outcome IS NOT NULL AND match_date >= {_ph}
+                ORDER BY match_date ASC
+            """, (cutoff_week,)).fetchall()
+        if not rows:
+            return {}
+        # Colonnes attendues par le reste de la fonction
+        col_names = [
+            "id", "sport", "league", "home_team", "away_team", "match_date",
+            "pred_result", "pred_name", "confidence", "is_value_bet",
+            "kelly_stake", "stake_pct", "expected_value", "odd_used",
+            "odd_closing", "opening_movement_pct", "outcome", "pnl",
+            "created_at", "market",
+        ]
+        try:
+            df = pd.DataFrame(rows, columns=col_names[:len(rows[0])])
+        except Exception:
+            # fallback si le schéma ne correspond pas exactement
+            df = pd.DataFrame(rows)
 
         if df.empty:
             return {}
