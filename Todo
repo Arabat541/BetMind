@@ -148,3 +148,47 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
   account_health.py — compute_account_health() : stake shrink, EV dégradé, taux EV négatif
   Score [0,1] — alerte Telegram si score < 50% — send_account_health_alert()
   /api/account_health dans dashboard.py + schedule.every().day.at("06:00") dans predictor.py
+
+
+## 🔴 Priorité 1 — Impact immédiat ROI
+
+### AV — Monte Carlo Kelly (risk of ruin réel)
+  Simuler 1000 scénarios sur 50 paris avec les probas du modèle
+  Si probabilité de ruine > 5% → réduire la mise automatiquement
+  Plus robuste que le Kelly fractionnel fixe actuel
+
+### AW — Expected Points (xPTS) par équipe
+  Calculer xPTS depuis xG Understat déjà en DB (xPTS = Σ proba_win*3 + proba_draw*1)
+  Écart pts_réels − xPTS → surperformance tend à régresser (très prédictif fin de saison)
+  Nouvelles features : home_xpts_diff, away_xpts_diff dans FEATURE_COLS
+
+### AX — Pondération temporelle dans l'entraînement
+  sample_weight exponentiel décroissant dans XGBClassifier (matchs récents pèsent plus)
+  Impact direct sur la précision en cours de saison sans changer l'architecture
+  Paramètre decay_rate à tuner avec Optuna
+
+
+## 🟠 Priorité 2 — Nouveaux marchés
+
+### AY — Marché Exact Goals (0/1/2/3/4+)
+  Distribution Poisson déjà calculée → dériver probas par nombre exact de buts
+  Marché peu efficient = edges plus faciles à trouver
+  Extension naturelle de dc_correct_scores() dans dixon_coles.py
+
+### AZ — Half Time / Full Time (HT/FT)
+  Prédire simultanément score mi-temps et résultat final (9 combinaisons HH/HD/HA/DH...)
+  Deux distributions Poisson indépendantes pour chaque mi-temps
+  Cotes HT/FT typiquement mal calibrées par les books
+
+
+## 🟡 Priorité 3 — Infrastructure & KPIs
+
+### BA — Rapport PDF hebdomadaire automatique
+  matplotlib + reportlab : PDF envoyé par Telegram chaque lundi
+  Graphiques ROI, CLV, SHAP importance, top/flop ligues sur 7 jours
+  Zéro clé API supplémentaire
+
+### BB — CLV réalisé à la fermeture (Closing Line Value)
+  result_checker.py : vérifier cote de clôture au moment du résultat
+  Calculer clv_realized = cote_fermeture / cote_utilisée − 1 → stocker en DB
+  KPI le plus critique pour valider l'edge long terme du modèle
