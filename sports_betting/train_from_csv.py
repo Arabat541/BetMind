@@ -155,6 +155,9 @@ FEATURE_COLS = [
     "home_congestion_score", "away_congestion_score",
     # Distance déplacement Away — AO
     "away_travel_km", "away_timezone_diff", "away_travel_score",
+    # Sentiment NLP blessures — AP
+    "home_injury_sentiment", "away_injury_sentiment",
+    "home_injury_count",     "away_injury_count",
 ]
 
 
@@ -801,6 +804,11 @@ def build_row_features(row: pd.Series,
         **_get_congestion_features(home, away, date, dates_dict),
         # Distance déplacement Away — AO
         **_get_travel_features(home, away),
+        # Sentiment NLP — AP (0.0 en training, actif en prédiction live)
+        "home_injury_sentiment": 0.0,
+        "away_injury_sentiment": 0.0,
+        "home_injury_count":     0.0,
+        "away_injury_count":     0.0,
     }
 
 

@@ -591,6 +591,32 @@ def send_steam_alert(steam_move: dict):
     send_message("\n".join(lines))
 
 
+def send_injury_sentiment_alert(home_team: str, away_team: str,
+                                league: str, match_date: str,
+                                home_data: dict, away_data: dict):
+    """Alerte Telegram si blessures significatives détectées (AP)."""
+    lines = [
+        "🏥 <b>ALERTE BLESSURES — NLP</b>",
+        "",
+        f"⚽ <b>{home_team} vs {away_team}</b>",
+        f"🏆 {league}",
+        f"📅 {match_date[:10] if match_date else ''}",
+        "",
+    ]
+    for label, team, data in [("Domicile", home_team, home_data),
+                               ("Extérieur", away_team, away_data)]:
+        if data.get("injury_count", 0) > 0 or data.get("sentiment", 0) < -0.3:
+            lines.append(f"<b>{label} — {team}</b>")
+            lines.append(f"  Sentiment : {data['sentiment']:+.2f} ({data['injury_count']} blessure(s))")
+            for h in data.get("headlines", [])[:3]:
+                lines.append(f"  • [{h['label']}] {h['title'][:80]}")
+            lines.append("")
+
+    lines += ["💡 <i>Source : RSS BBC Sport / Sky Sports / Guardian</i>",
+              "─" * 30, "🤖 BetMind Agent"]
+    send_message("\n".join(lines))
+
+
 def send_account_health_alert(report: dict):
     """Alerte Telegram pour la santé des comptes bookmakers (AU)."""
     lines = [

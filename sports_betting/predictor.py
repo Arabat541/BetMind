@@ -23,7 +23,7 @@ from data_fetcher import (
 from feature_engineering import build_football_features, build_nba_features
 from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds, build_bhg_signal, fetch_bhg_odds, detect_dutching_opportunity, enrich_signal_with_line_shop
 from bankroll import BankrollTracker, recommended_stake
-from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert, send_bhg_alert, send_dutch_alert
+from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert, send_bhg_alert, send_dutch_alert, send_injury_sentiment_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +109,24 @@ def run_football_predictions():
             if remaining <= 0:
                 logger.info(f"Limite journalière atteinte ({daily_staked:,.0f}/{daily_limit:,.0f} FCFA). Arrêt football.")
                 break
+
+            # ── AP — Sentiment NLP blessures (avant features) ────
+            try:
+                from sentiment_fetcher import fetch_injury_sentiment
+                h_sent = fetch_injury_sentiment(fix["home_team"])
+                a_sent = fetch_injury_sentiment(fix["away_team"])
+                if h_sent["injury_count"] >= 2 or a_sent["injury_count"] >= 2 \
+                        or h_sent["sentiment"] <= -0.5 or a_sent["sentiment"] <= -0.5:
+                    send_injury_sentiment_alert(
+                        home_team=fix["home_team"],
+                        away_team=fix["away_team"],
+                        league=fix["league"],
+                        match_date=str(fix.get("date", "")),
+                        home_data=h_sent,
+                        away_data=a_sent,
+                    )
+            except Exception:
+                pass
 
             features = build_football_features(
                 home_id=fix["home_id"],

@@ -239,6 +239,15 @@ def build_football_features(home_id: int, away_id: int,
         for k in ("away_travel_km", "away_timezone_diff", "away_travel_score"):
             features[k] = 0.0
 
+    # ── AP — Sentiment NLP (rumeurs blessures) ────────────────
+    try:
+        from sentiment_fetcher import build_sentiment_features
+        features.update(build_sentiment_features(home_name, away_name))
+    except Exception:
+        for k in ("home_injury_sentiment", "away_injury_sentiment",
+                  "home_injury_count", "away_injury_count"):
+            features[k] = 0.0
+
     return features
 
 

@@ -1486,6 +1486,20 @@ def api_xg_squad():
     return jsonify({"xg": xg_rows, "squad": sq_rows})
 
 
+@app.route("/api/injury_news")
+def api_injury_news():
+    """AP — Sentiment NLP : rumeurs blessures pour une équipe."""
+    team = request.args.get("team", "")
+    if not team:
+        return jsonify({"error": "param 'team' requis"}), 400
+    try:
+        from sentiment_fetcher import fetch_injury_sentiment
+        data = fetch_injury_sentiment(team)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"sentiment": 0.0, "injury_count": 0, "headlines": [], "error": str(e)})
+
+
 @app.route("/api/account_health")
 def api_account_health():
     """AU — Score de santé du compte bookmaker."""
