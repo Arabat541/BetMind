@@ -4,15 +4,36 @@
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
+from flask.json.provider import DefaultJSONProvider
 from data_fetcher import get_all_predictions
 from bankroll import BankrollTracker
 from config import FLASK_PORT, FLASK_DEBUG
 from db import get_conn, raw_conn, ph as _ph, is_postgres
 
+
+def _sanitize_nan(obj):
+    """Remplace récursivement NaN/Inf par None pour un JSON valide."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nan(v) for v in obj]
+    return obj
+
+
+class _NaNSafeProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return super().dumps(_sanitize_nan(obj), **kwargs)
+
+
 app = Flask(__name__)
+app.json_provider_class = _NaNSafeProvider
+app.json = _NaNSafeProvider(app)
 tracker = BankrollTracker()
 logger  = logging.getLogger(__name__)
 
