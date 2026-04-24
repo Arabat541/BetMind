@@ -814,6 +814,7 @@ def init_db():
         ("odd_opening",          "REAL DEFAULT NULL"),
         ("opening_movement_pct", "REAL DEFAULT NULL"),
         ("market",               "TEXT DEFAULT NULL"),
+        ("clv_realized",         "REAL DEFAULT NULL"),   # BB — CLV réalisé à la fermeture
     ]
     if_not_exists = "IF NOT EXISTS " if is_postgres() else ""
     for col, col_type in _migrations:
@@ -825,13 +826,31 @@ def init_db():
         except Exception:
             pass  # colonne déjà présente
 
+    # PostgreSQL : resynchronise la séquence predictions_id_seq au cas où elle
+    # serait désynchronisée après une migration SQLite→PG (rows copiés avec IDs explicites).
+    if is_postgres():
+        try:
+            with get_conn() as conn:
+                conn.execute(
+                    "SELECT setval('predictions_id_seq', GREATEST(nextval('predictions_id_seq')-1,"
+                    " (SELECT COALESCE(MAX(id),0) FROM predictions)))"
+                )
+        except Exception:
+            pass
+
     logger.info("Database initialized.")
 
 
 def save_prediction(pred: dict):
-    from db import get_conn, ph
+    from db import get_conn, ph, is_postgres
     try:
         with get_conn() as conn:
+            # ON CONFLICT DO NOTHING : si le même match est déjà enregistré
+            # (même équipes + date + market), on ignore silencieusement.
+            conflict_clause = (
+                "ON CONFLICT (home_team, away_team, match_date, sport, market) DO NOTHING"
+                if is_postgres() else ""
+            )
             conn.execute(f"""
                 INSERT INTO predictions
                 (sport,league,home_team,away_team,match_date,pred_result,
@@ -839,6 +858,7 @@ def save_prediction(pred: dict):
                  home_injuries_out,home_injuries_dtd,away_injuries_out,away_injuries_dtd,
                  method,odd_opening,market)
                 VALUES ({','.join([ph]*21)})
+                {conflict_clause}
             """, (
                 pred.get("sport"), pred.get("league"), pred.get("home_team"), pred.get("away_team"),
                 pred.get("match_date"), pred.get("pred_result"), pred.get("prob_home"),

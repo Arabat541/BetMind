@@ -5,6 +5,7 @@
 import logging
 import sqlite3
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from config import (
     KELLY_FRACTION, KELLY_FRACTION_DRAW, MAX_BET_PCT, INITIAL_BANKROLL, DB_PATH
@@ -64,6 +65,76 @@ def kelly_stake(prob: float, odd: float, bankroll: float,
     }
 
 
+# ════════════════════════════════════════════════════════════
+# MONTE CARLO KELLY — AV
+# ════════════════════════════════════════════════════════════
+
+def monte_carlo_kelly(
+    prob: float,
+    odd: float,
+    bankroll: float,
+    n_simulations: int = 1000,
+    n_bets: int = 50,
+    ruin_threshold: float = 0.10,
+    ruin_prob_max: float = 0.05,
+    fraction: float = KELLY_FRACTION,
+    max_pct: float = MAX_BET_PCT,
+) -> dict:
+    """
+    Simule 1000 scénarios de 50 paris pour estimer P(ruine).
+    Si P(bankroll < ruin_threshold) > ruin_prob_max, réduit la fraction Kelly
+    par paliers (0.75 / 0.50 / 0.33 / 0.25) jusqu'à sécurité.
+    """
+    if odd <= 1.0 or prob <= 0 or prob >= 1:
+        return {"stake_pct": 0, "stake_amount": 0, "ruin_prob": 0.0,
+                "mc_fraction": fraction, "kelly_raw": 0, "expected_value": 0,
+                "profit_expected": 0}
+
+    b = odd - 1
+    q = 1 - prob
+    kelly_raw = (b * prob - q) / b
+
+    if kelly_raw <= 0:
+        return {"stake_pct": 0, "stake_amount": 0, "ruin_prob": 0.0,
+                "mc_fraction": fraction, "kelly_raw": round(kelly_raw, 4),
+                "expected_value": round(prob * b - q, 4), "profit_expected": 0}
+
+    rng = np.random.default_rng(42)
+
+    def _ruin_prob(f: float) -> tuple[float, float]:
+        sp = min(kelly_raw * f, max_pct)
+        wins = rng.random((n_simulations, n_bets)) < prob
+        # Multiplicative Kelly: factor per bet = (1 + sp*b) si win, (1 - sp) si loss
+        factors = np.where(wins, 1.0 + sp * b, 1.0 - sp)
+        cum_br = np.cumprod(factors, axis=1)
+        return float((cum_br < ruin_threshold).any(axis=1).mean()), sp
+
+    ruin_prob, stake_pct = _ruin_prob(fraction)
+    safe_fraction = fraction
+
+    if ruin_prob > ruin_prob_max:
+        for scale in [0.75, 0.50, 0.33, 0.25]:
+            rp, sp = _ruin_prob(fraction * scale)
+            safe_fraction = fraction * scale
+            stake_pct = sp
+            ruin_prob = rp
+            if rp <= ruin_prob_max:
+                break
+
+    ev = prob * b - q
+    stake_amount = round(bankroll * stake_pct)
+
+    return {
+        "kelly_raw":      round(kelly_raw, 4),
+        "stake_pct":      round(stake_pct, 4),
+        "stake_amount":   stake_amount,
+        "expected_value": round(ev, 4),
+        "profit_expected": round(stake_amount * ev, 0),
+        "ruin_prob":      round(ruin_prob, 4),
+        "mc_fraction":    round(safe_fraction, 4),
+    }
+
+
 def _is_draw_bet(result_name: str) -> bool:
     """Détecte si le pari porte sur le nul (outcome le plus imprévisible)."""
     return result_name.strip().lower() in ("draw", "d", "nul", "draw win")
@@ -80,7 +151,7 @@ def recommended_stake(signal: dict, bankroll: float) -> dict:
     if value_bets:
         vb = value_bets[0]  # meilleur edge
         fraction = KELLY_FRACTION_DRAW if _is_draw_bet(vb.get("result_name", "")) else KELLY_FRACTION
-        result = kelly_stake(
+        result = monte_carlo_kelly(
             prob=vb["p_model"],
             odd=vb["odd"],
             bankroll=bankroll,
@@ -96,7 +167,7 @@ def recommended_stake(signal: dict, bankroll: float) -> dict:
         odd  = signal.get("odd_used") or 1.0
         pred_name = signal.get("pred_name", "")
         fraction = KELLY_FRACTION_DRAW if _is_draw_bet(pred_name) else KELLY_FRACTION
-        result = kelly_stake(prob=conf, odd=odd, bankroll=bankroll, fraction=fraction)
+        result = monte_carlo_kelly(prob=conf, odd=odd, bankroll=bankroll, fraction=fraction)
         result["bet_on"]   = pred_name
         result["odd"]      = odd
         result["edge"]     = 0.0

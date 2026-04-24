@@ -158,6 +158,8 @@ FEATURE_COLS = [
     # Sentiment NLP blessures — AP
     "home_injury_sentiment", "away_injury_sentiment",
     "home_injury_count",     "away_injury_count",
+    # Expected Points — AW
+    "home_xpts", "away_xpts", "home_xpts_diff", "away_xpts_diff",
 ]
 
 
@@ -644,6 +646,60 @@ def _get_travel_features(home: str, away: str) -> dict:
         return {"away_travel_km": 0.0, "away_timezone_diff": 0.0, "away_travel_score": 0.0}
 
 
+# ════════════════════════════════════════════════════════════
+# EXPECTED POINTS (xPTS) — AW
+# ════════════════════════════════════════════════════════════
+
+def _compute_xpts(xg_for: float, xg_against: float, max_goals: int = 8) -> float:
+    """xPTS par match = P(win)*3 + P(draw) via Poisson bivarié."""
+    try:
+        from scipy.stats import poisson as _pois
+        lf = max(float(xg_for),     1e-6)
+        la = max(float(xg_against), 1e-6)
+        p_win = p_draw = 0.0
+        for i in range(max_goals + 1):
+            pi = _pois.pmf(i, lf)
+            for j in range(max_goals + 1):
+                pj = _pois.pmf(j, la)
+                if i > j:
+                    p_win  += pi * pj
+                elif i == j:
+                    p_draw += pi * pj
+        return round(p_win * 3.0 + p_draw, 4)
+    except Exception:
+        return 1.0
+
+
+def _get_xpts_features(home: str, away: str, xg_feats: dict,
+                       hs: dict, ass: dict) -> dict:
+    """
+    Calcule xPTS depuis les moyennes xG et compare aux vraies pts/game.
+    xpts_diff > 0 → équipe surperforme ses xG (probable régression).
+    """
+    home_xpts = _compute_xpts(xg_feats.get("home_xg_avg", 0.0),
+                               xg_feats.get("home_xga_avg", 0.0))
+    away_xpts = _compute_xpts(xg_feats.get("away_xg_avg", 0.0),
+                               xg_feats.get("away_xga_avg", 0.0))
+    return {
+        "home_xpts":      home_xpts,
+        "away_xpts":      away_xpts,
+        "home_xpts_diff": round(hs.get("pts_per_game", 1.0)  - home_xpts, 4),
+        "away_xpts_diff": round(ass.get("pts_per_game", 1.0) - away_xpts, 4),
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# PONDÉRATION TEMPORELLE — AX
+# ════════════════════════════════════════════════════════════
+
+def _compute_sample_weights(dates: pd.Series, decay_rate: float) -> np.ndarray:
+    """Poids exponentiels décroissants : les matchs récents comptent plus."""
+    today = pd.Timestamp.now().normalize()
+    days_ago = (today - pd.to_datetime(dates)).dt.days.clip(lower=0).values.astype(float)
+    w = np.exp(-decay_rate * days_ago / 365.0)
+    return (w / w.mean()).astype(float)
+
+
 def build_row_features(row: pd.Series,
                        history: dict, dates_dict: dict,
                        h2h_db: dict,
@@ -797,7 +853,7 @@ def build_row_features(row: pd.Series,
         # Feature arbitre — X
         **_get_referee_features(getattr(row, "Referee", None), referee_stats),
         # xG réel Understat — W
-        **_get_xg_features(home, away, date, xg_history),
+        **(_xg_feats := _get_xg_features(home, away, date, xg_history)),
         # Valeur marchande effectifs — Y
         **_get_squad_value_features(home, away, squad_values),
         # Fixture congestion — AN
@@ -809,6 +865,8 @@ def build_row_features(row: pd.Series,
         "away_injury_sentiment": 0.0,
         "home_injury_count":     0.0,
         "away_injury_count":     0.0,
+        # Expected Points — AW
+        **_get_xpts_features(home, away, xg_feats, hs, ass),
     }
 
 
@@ -878,7 +936,8 @@ def save_team_shots_lookup(all_df: pd.DataFrame):
 # OPTUNA — HYPERPARAMETER TUNING (D)
 # ════════════════════════════════════════════════════════════
 
-def _optuna_objective(trial, X: pd.DataFrame, y: pd.Series) -> float:
+def _optuna_objective(trial, X: pd.DataFrame, y: pd.Series,
+                      dates: pd.Series | None = None) -> float:
     params = {
         "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
         "max_depth":        trial.suggest_int("max_depth", 3, 7),
@@ -891,16 +950,20 @@ def _optuna_objective(trial, X: pd.DataFrame, y: pd.Series) -> float:
         "n_jobs":           -1,
         "use_label_encoder": False,
     }
+    # AX — decay_rate pour pondération temporelle
+    decay_rate = trial.suggest_float("decay_rate", 0.0, 3.0)
     tss    = TimeSeriesSplit(n_splits=3)
     losses = []
     for tr_idx, val_idx in tss.split(X):
-        m = XGBClassifier(**params)
-        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        m  = XGBClassifier(**params)
+        sw = _compute_sample_weights(dates.iloc[tr_idx], decay_rate) if dates is not None else None
+        m.fit(X.iloc[tr_idx], y.iloc[tr_idx], sample_weight=sw)
         losses.append(log_loss(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])))
     return float(np.mean(losses))
 
 
-def optimize_hyperparams(X: pd.DataFrame, y: pd.Series, n_trials: int = 40) -> dict:
+def optimize_hyperparams(X: pd.DataFrame, y: pd.Series, n_trials: int = 40,
+                         dates: pd.Series | None = None) -> dict:
     """Optuna search — minimise log_loss sur TimeSeriesSplit(3). Sauvegarde dans best_params_football.json."""
     if not OPTUNA_OK:
         logger.warning("Optuna non installé — hyperparamètres par défaut.")
@@ -912,7 +975,7 @@ def optimize_hyperparams(X: pd.DataFrame, y: pd.Series, n_trials: int = 40) -> d
         sampler=optuna.samplers.TPESampler(seed=42),
     )
     study.optimize(
-        lambda t: _optuna_objective(t, X, y),
+        lambda t: _optuna_objective(t, X, y, dates),
         n_trials=n_trials,
         n_jobs=1,
         show_progress_bar=False,
@@ -999,7 +1062,8 @@ def compute_shap(X: pd.DataFrame, y: pd.Series, xgb_params: dict):
 # ENSEMBLE XGB + LGB + STACKING (C)
 # ════════════════════════════════════════════════════════════
 
-def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleModel | None:
+def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict,
+                   sample_weight: np.ndarray | None = None) -> EnsembleModel | None:
     """
     Entraîne XGB + LGB comme base-learners via OOF TimeSeriesSplit(5),
     puis un méta-modèle LogisticRegression sur les probas empilées.
@@ -1035,8 +1099,9 @@ def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleM
 
         xgb_f = XGBClassifier(**xgb_params)
         lgb_f = LGBMClassifier(**lgb_params)
-        xgb_f.fit(X_tr, y_tr)
-        lgb_f.fit(X_tr, y_tr)
+        sw_tr = sample_weight[tr_idx] if sample_weight is not None else None
+        xgb_f.fit(X_tr, y_tr, sample_weight=sw_tr)
+        lgb_f.fit(X_tr, y_tr, sample_weight=sw_tr)
 
         meta_X[val_idx, :n_cls]    = xgb_f.predict_proba(X_val)
         meta_X[val_idx, n_cls:]    = lgb_f.predict_proba(X_val)
@@ -1058,8 +1123,8 @@ def train_ensemble(X: pd.DataFrame, y: pd.Series, xgb_params: dict) -> EnsembleM
     logger.info("Entraînement des base-learners finaux (toutes données)...")
     xgb_final = XGBClassifier(**xgb_params)
     lgb_final = LGBMClassifier(**lgb_params)
-    xgb_final.fit(X, y)
-    lgb_final.fit(X, y)
+    xgb_final.fit(X, y, sample_weight=sample_weight)
+    lgb_final.fit(X, y, sample_weight=sample_weight)
 
     ensemble = EnsembleModel(
         xgb_model=xgb_final,
@@ -1156,7 +1221,7 @@ def train():
     # 3. Construction du dataset
     logger.info("Construction des features...")
     LABEL = {"H": 0, "D": 1, "A": 2}
-    rows_X, rows_y = [], []
+    rows_X, rows_y, rows_dates = [], [], []
 
     for i, row in all_df.iterrows():
         label = LABEL.get(str(row.get("FTR", "")).strip())
@@ -1176,12 +1241,14 @@ def train():
 
         rows_X.append({c: feats.get(c, 0.0) for c in FEATURE_COLS})
         rows_y.append(label)
+        rows_dates.append(row["Date"])
 
         if (i + 1) % 2000 == 0:
             logger.info(f"  {i + 1}/{len(all_df)} matchs traités…")
 
-    X = pd.DataFrame(rows_X, columns=FEATURE_COLS)
-    y = pd.Series(rows_y)
+    X            = pd.DataFrame(rows_X, columns=FEATURE_COLS)
+    y            = pd.Series(rows_y)
+    dates_series = pd.Series(rows_dates).reset_index(drop=True)
     logger.info(
         f"Dataset : {len(X)} matchs | "
         f"H={int((y == 0).sum())} D={int((y == 1).sum())} A={int((y == 2).sum())}"
@@ -1191,13 +1258,18 @@ def train():
         logger.error("Pas assez de données (< 500). Vérifier les téléchargements.")
         sys.exit(1)
 
-    # 4. Optuna hyperparameter tuning — D
-    best_params = optimize_hyperparams(X, y, n_trials=40)
+    # 4. Optuna hyperparameter tuning — D + AX (decay_rate)
+    best_params = optimize_hyperparams(X, y, n_trials=40, dates=dates_series)
     xgb_params  = best_params if best_params else {
         "n_estimators": 300, "max_depth": 5, "learning_rate": 0.05,
         "subsample": 0.8, "colsample_bytree": 0.8,
         "eval_metric": "mlogloss", "random_state": 42, "n_jobs": -1,
     }
+
+    # AX — extraire decay_rate des best_params et calculer sample_weights
+    decay_rate = float(xgb_params.pop("decay_rate", 1.0))
+    sample_weights = _compute_sample_weights(dates_series, decay_rate)
+    logger.info(f"AX — pondération temporelle : decay_rate={decay_rate:.3f}")
 
     # 5. Walk-forward validation — B
     logger.info("Walk-forward validation (TimeSeriesSplit n_splits=5)...")
@@ -1208,10 +1280,11 @@ def train():
     for fold, (tr_idx, val_idx) in enumerate(tss.split(X)):
         X_tr,  X_val  = X.iloc[tr_idx],  X.iloc[val_idx]
         y_tr,  y_val  = y.iloc[tr_idx],  y.iloc[val_idx]
+        sw_tr         = sample_weights[tr_idx]
 
         base = XGBClassifier(**xgb_params)
         m    = CalibratedClassifierCV(base, cv=3, method="isotonic")
-        m.fit(X_tr, y_tr)
+        m.fit(X_tr, y_tr, sample_weight=sw_tr)
 
         acc = accuracy_score(y_val, m.predict(X_val))
         ll  = log_loss(y_val, m.predict_proba(X_val))
@@ -1231,14 +1304,14 @@ def train():
     logger.info("Entraînement final (toutes données)...")
     base_final  = XGBClassifier(**xgb_params)
     final_model = CalibratedClassifierCV(base_final, cv=5, method="isotonic")
-    final_model.fit(X, y)
+    final_model.fit(X, y, sample_weight=sample_weights)
 
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(final_model, f)
     logger.info(f"Modèle sauvegardé : {MODEL_PATH}")
 
     # 7. Ensemble XGB + LGB + stacking — C
-    train_ensemble(X, y, xgb_params)
+    train_ensemble(X, y, xgb_params, sample_weight=sample_weights)
 
     # 8. SHAP feature importance — I
     compute_shap(X, y, xgb_params)

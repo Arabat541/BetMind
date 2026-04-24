@@ -254,20 +254,81 @@ def get_nba_result(home_team: str, away_team: str, match_date: str) -> str | Non
 # ════════════════════════════════════════════════════════════
 
 def settle_prediction(pred_id: int, outcome: str, pred_result: str,
-                      kelly_stake: float, odd_used: float):
-    """Met à jour une prédiction et calcule le PnL."""
+                      kelly_stake: float, odd_used: float,
+                      odd_closing: float | None = None):
+    """Met à jour une prédiction et calcule le PnL + CLV réalisé (BB)."""
     won   = (pred_result == outcome)
     stake = kelly_stake or 0
     odd   = odd_used or 1.0
     pnl   = round(stake * (odd - 1), 0) if (won and stake > 0 and odd > 1) else (-stake if stake > 0 else 0.0)
 
+    # CLV réalisé = cote_fermeture / cote_utilisée − 1 (BB)
+    clv_realized: float | None = None
+    if odd_closing and odd_closing > 1.0 and odd > 1.0:
+        clv_realized = round(odd_closing / odd - 1.0, 4)
+
     with get_conn() as conn:
-        conn.execute(f"UPDATE predictions SET outcome={_ph}, pnl={_ph} WHERE id={_ph}", (outcome, pnl, pred_id))
+        if clv_realized is not None:
+            conn.execute(
+                f"UPDATE predictions SET outcome={_ph}, pnl={_ph}, "
+                f"odd_closing={_ph}, clv_realized={_ph} WHERE id={_ph}",
+                (outcome, pnl, odd_closing, clv_realized, pred_id)
+            )
+        else:
+            conn.execute(
+                f"UPDATE predictions SET outcome={_ph}, pnl={_ph} WHERE id={_ph}",
+                (outcome, pnl, pred_id)
+            )
 
     if stake > 0:
         tracker.settle_bet(pred_id, outcome)
 
     return won, pnl
+
+
+# ════════════════════════════════════════════════════════════
+# BB — CLV RÉALISÉ À LA FERMETURE
+# ════════════════════════════════════════════════════════════
+
+def update_clv_realized():
+    """
+    Pour les prédictions réglées sans clv_realized, tente de le calculer
+    depuis odd_closing (si déjà stockée) et odd_used.
+    À appeler périodiquement (ex: quotidien).
+    """
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(f"""
+                SELECT id, odd_used, odd_closing FROM predictions
+                WHERE outcome IS NOT NULL
+                  AND clv_realized IS NULL
+                  AND odd_used IS NOT NULL
+                  AND odd_closing IS NOT NULL
+                  AND odd_used > 1
+                  AND odd_closing > 1
+            """).fetchall()
+    except Exception as e:
+        logger.warning(f"update_clv_realized: {e}")
+        return
+
+    updated = 0
+    with get_conn() as conn:
+        for row in rows:
+            pid = row[0] if isinstance(row, (list, tuple)) else row["id"]
+            odd_u = row[1] if isinstance(row, (list, tuple)) else row["odd_used"]
+            odd_c = row[2] if isinstance(row, (list, tuple)) else row["odd_closing"]
+            try:
+                clv = round(float(odd_c) / float(odd_u) - 1.0, 4)
+                conn.execute(
+                    f"UPDATE predictions SET clv_realized={_ph} WHERE id={_ph}",
+                    (clv, pid)
+                )
+                updated += 1
+            except Exception:
+                pass
+
+    if updated > 0:
+        logger.info(f"BB — CLV réalisé calculé pour {updated} prédictions.")
 
 
 def _send_result_alert(pred, outcome: str, won: bool, pnl: float):

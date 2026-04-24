@@ -118,6 +118,66 @@ def dc_correct_scores(lam_h: float, lam_a: float, rho: float,
 
 
 # ════════════════════════════════════════════════════════════
+# EXACT GOALS — AY
+# ════════════════════════════════════════════════════════════
+
+def dc_exact_goals(lam_h: float, lam_a: float, rho: float) -> dict:
+    """
+    P(total goals = 0 / 1 / 2 / 3 / 4+) corrigé Dixon-Coles.
+    Retourne dict {"0": p, "1": p, "2": p, "3": p, "4+": p}.
+    """
+    mat = dc_score_matrix(lam_h, lam_a, rho)
+    result: dict = {}
+    for n in range(4):
+        p = sum(mat[i, j]
+                for i in range(MAX_GOALS + 1)
+                for j in range(MAX_GOALS + 1)
+                if i + j == n)
+        result[str(n)] = round(float(p), 5)
+    p4plus = sum(mat[i, j]
+                 for i in range(MAX_GOALS + 1)
+                 for j in range(MAX_GOALS + 1)
+                 if i + j >= 4)
+    result["4+"] = round(float(p4plus), 5)
+    return result
+
+
+# ════════════════════════════════════════════════════════════
+# HALF TIME / FULL TIME — AZ
+# ════════════════════════════════════════════════════════════
+
+def dc_htft(lam_h: float, lam_a: float, rho: float,
+            ht_ratio: float = 0.50) -> dict:
+    """
+    Probabilités HT/FT pour les 9 combinaisons (HH, HD, HA, DH, DD, DA, AH, AD, AA).
+    Modélise chaque mi-temps par une distribution Poisson indépendante.
+    ht_ratio = part des buts attendus en première mi-temps (défaut 50%).
+    """
+    lh1, la1 = lam_h * ht_ratio,        lam_a * ht_ratio
+    lh2, la2 = lam_h * (1 - ht_ratio),  lam_a * (1 - ht_ratio)
+
+    def _res(h: int, a: int) -> str:
+        return "H" if h > a else ("D" if h == a else "A")
+
+    probs: dict = {f"{r1}{r2}": 0.0 for r1 in "HDA" for r2 in "HDA"}
+    cap = min(MAX_GOALS, 6)  # 7^4 = 2401 combos — rapide
+
+    for h1 in range(cap + 1):
+        ph1 = _poisson_pmf(h1, lh1)
+        for a1 in range(cap + 1):
+            p_ht = ph1 * _poisson_pmf(a1, la1)
+            ht_r = _res(h1, a1)
+            for h2 in range(cap + 1):
+                ph2 = _poisson_pmf(h2, lh2)
+                for a2 in range(cap + 1):
+                    p_h2 = ph2 * _poisson_pmf(a2, la2)
+                    probs[f"{ht_r}{_res(h1 + h2, a1 + a2)}"] += p_ht * p_h2
+
+    total = sum(probs.values())
+    return {k: round(v / total, 5) for k, v in probs.items()} if total > 0 else probs
+
+
+# ════════════════════════════════════════════════════════════
 # CALIBRATION DE ρ
 # ════════════════════════════════════════════════════════════
 

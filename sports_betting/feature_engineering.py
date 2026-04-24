@@ -248,6 +248,23 @@ def build_football_features(home_id: int, away_id: int,
                   "home_injury_count", "away_injury_count"):
             features[k] = 0.0
 
+    # ── AW — Expected Points (xPTS) ──────────────────────────
+    try:
+        from train_from_csv import _compute_xpts
+        home_xpts = _compute_xpts(features.get("home_xg_avg", 0.0),
+                                   features.get("home_xga_avg", 0.0))
+        away_xpts = _compute_xpts(features.get("away_xg_avg", 0.0),
+                                   features.get("away_xga_avg", 0.0))
+        features.update({
+            "home_xpts":      home_xpts,
+            "away_xpts":      away_xpts,
+            "home_xpts_diff": round(features.get("home_pts_per_game", 1.0) - home_xpts, 4),
+            "away_xpts_diff": round(features.get("away_pts_per_game", 1.0) - away_xpts, 4),
+        })
+    except Exception:
+        for k in ("home_xpts", "away_xpts", "home_xpts_diff", "away_xpts_diff"):
+            features[k] = 0.0
+
     return features
 
 

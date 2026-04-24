@@ -1348,3 +1348,252 @@ def build_prediction_signal(
         signal["edge"]         = 0.0
 
     return signal
+
+
+# ════════════════════════════════════════════════════════════
+# AY — MARCHÉ EXACT GOALS
+# ════════════════════════════════════════════════════════════
+
+EG_EDGE_MIN = 0.08   # edge minimum pour alerter
+EG_MIN_PROB = 0.05   # probabilité modèle minimum
+
+def _implied_exact_goals_from_totals(totals_outcomes: list) -> dict:
+    """
+    Dérive les probas de buts exacts depuis les cotes over/under.
+    totals_outcomes : [{"name": "Over", "point": 0.5, "price": 1.25}, ...]
+    Retourne {"0": p, "1": p, "2": p, "3": p, "4+": p} ou {}.
+    """
+    over_prob: dict = {}
+    for o in totals_outcomes:
+        if o.get("name", "").lower() != "over":
+            continue
+        pt = o.get("point")
+        price = o.get("price")
+        if pt is not None and price and price > 1:
+            over_prob[float(pt)] = 1.0 / float(price)
+
+    if not over_prob:
+        return {}
+
+    result = {}
+    for n in range(5):
+        lo, hi = float(n) - 0.5, float(n) + 0.5
+        p_lo = over_prob.get(lo, 1.0 if n == 0 else 0.0)
+        p_hi = over_prob.get(hi, 0.0)
+        label = str(n) if n < 4 else "4+"
+        result[label] = round(max(0.0, p_lo - p_hi), 5)
+
+    if "4+" not in result and 3.5 in over_prob:
+        result["4+"] = round(over_prob[3.5], 5)
+
+    return result
+
+
+def fetch_exact_goals_odds(league_key: str) -> dict:
+    """
+    Récupère le marché 'totals' pour dériver les probas de buts exacts.
+    Retourne {event_key: {label: implied_prob}}.
+    """
+    from config import THE_ODDS_API_KEY, ODDS_API_BASE
+    if not THE_ODDS_API_KEY:
+        return {}
+    try:
+        import requests
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/{league_key}/odds",
+            params={"apiKey": THE_ODDS_API_KEY, "markets": "totals",
+                    "regions": "eu", "oddsFormat": "decimal"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        out = {}
+        for event in resp.json():
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            key  = f"{home}|{away}"
+            for book in event.get("bookmakers", []):
+                for mkt in book.get("markets", []):
+                    if mkt.get("key") != "totals":
+                        continue
+                    impl = _implied_exact_goals_from_totals(mkt.get("outcomes", []))
+                    if impl:
+                        out[key] = impl
+                    break
+                if key in out:
+                    break
+        return out
+    except Exception:
+        return {}
+
+
+def build_exact_goals_signal(features: dict, eg_implied: dict,
+                             match_info: dict) -> dict | None:
+    """
+    Détecte un value bet sur le marché Exact Goals (0/1/2/3/4+).
+    eg_implied : {label: implied_prob} depuis fetch_exact_goals_odds().
+    """
+    if not eg_implied:
+        return None
+    try:
+        from dixon_coles import dc_exact_goals, load_rho
+    except ImportError:
+        return None
+
+    lam_h = features.get("home_lambda", 1.4)
+    lam_a = features.get("away_lambda", 1.1)
+    rho   = load_rho("global")
+    model = dc_exact_goals(lam_h, lam_a, rho)
+
+    best_vb = None
+    for label, p_impl in eg_implied.items():
+        p_model = model.get(label, 0.0)
+        if p_model < EG_MIN_PROB or p_impl <= 0:
+            continue
+        edge = p_model - p_impl
+        if edge < EG_EDGE_MIN:
+            continue
+        implied_odd = round(1 / p_impl, 2)
+        ev = round(p_model * implied_odd - 1, 4)
+        if ev <= 0:
+            continue
+        vb = {"label": label, "p_model": round(p_model, 4),
+              "p_implied": round(p_impl, 4), "edge": round(edge, 4),
+              "implied_odd": implied_odd, "ev": ev}
+        if best_vb is None or vb["edge"] > best_vb["edge"]:
+            best_vb = vb
+
+    if best_vb is None:
+        return None
+
+    return {
+        "sport":       "football",
+        "league":      match_info.get("league", ""),
+        "home_team":   match_info.get("home_team", ""),
+        "away_team":   match_info.get("away_team", ""),
+        "match_date":  match_info.get("date", ""),
+        "market":      "EXACT_GOALS",
+        "best_vb":     best_vb,
+        "model_probs": model,
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# AZ — MARCHÉ HALF TIME / FULL TIME
+# ════════════════════════════════════════════════════════════
+
+HTFT_EDGE_MIN = 0.07
+HTFT_MIN_PROB = 0.08
+
+_HTFT_NAMES = {
+    "HH": "Dom/Dom", "HD": "Dom/Nul", "HA": "Dom/Ext",
+    "DH": "Nul/Dom", "DD": "Nul/Nul", "DA": "Nul/Ext",
+    "AH": "Ext/Dom", "AD": "Ext/Nul", "AA": "Ext/Ext",
+}
+
+
+def fetch_htft_odds(league_key: str) -> dict:
+    """
+    Récupère les cotes 1ère mi-temps (h2h_h1) depuis The Odds API.
+    Retourne {event_key: {"H": odd, "D": odd, "A": odd}}.
+    """
+    from config import THE_ODDS_API_KEY, ODDS_API_BASE
+    if not THE_ODDS_API_KEY:
+        return {}
+    try:
+        import requests
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/{league_key}/odds",
+            params={"apiKey": THE_ODDS_API_KEY, "markets": "h2h_h1",
+                    "regions": "eu", "oddsFormat": "decimal"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        out = {}
+        for event in resp.json():
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            key  = f"{home}|{away}"
+            for book in event.get("bookmakers", []):
+                for mkt in book.get("markets", []):
+                    if mkt.get("key") != "h2h_h1":
+                        continue
+                    odds: dict = {}
+                    for o in mkt.get("outcomes", []):
+                        nm = o.get("name", "")
+                        pr = o.get("price")
+                        if nm == home:     odds["H"] = pr
+                        elif nm == "Draw": odds["D"] = pr
+                        elif nm == away:   odds["A"] = pr
+                    if odds:
+                        out[key] = odds
+                    break
+                if key in out:
+                    break
+        return out
+    except Exception:
+        return {}
+
+
+def build_htft_signal(features: dict, h1_odds: dict,
+                      match_info: dict) -> dict | None:
+    """
+    Construit un signal HT/FT. Compare la distribution HT complète du modèle
+    aux cotes H1 disponibles. Alerte si edge ≥ HTFT_EDGE_MIN.
+    """
+    if not h1_odds:
+        return None
+    try:
+        from dixon_coles import dc_htft, load_rho
+    except ImportError:
+        return None
+
+    lam_h = features.get("home_lambda", 1.4)
+    lam_a = features.get("away_lambda", 1.1)
+    rho   = load_rho("global")
+    htft  = dc_htft(lam_h, lam_a, rho)
+
+    p_h1 = {
+        "H": sum(v for k, v in htft.items() if k.startswith("H")),
+        "D": sum(v for k, v in htft.items() if k.startswith("D")),
+        "A": sum(v for k, v in htft.items() if k.startswith("A")),
+    }
+
+    best_vb = None
+    for side, p_model in p_h1.items():
+        odd = h1_odds.get(side)
+        if not odd or odd <= 1.0 or p_model < HTFT_MIN_PROB:
+            continue
+        try:
+            odd = float(odd)
+        except (TypeError, ValueError):
+            continue
+        p_impl = 1.0 / odd
+        edge   = p_model - p_impl
+        ev     = p_model * odd - 1
+        if edge < HTFT_EDGE_MIN or ev <= 0:
+            continue
+        vb = {"side": side, "p_model": round(p_model, 4),
+              "p_implied": round(p_impl, 4), "edge": round(edge, 4),
+              "odd": round(odd, 3), "ev": round(ev, 4)}
+        if best_vb is None or vb["edge"] > best_vb["edge"]:
+            best_vb = vb
+
+    if best_vb is None:
+        return None
+
+    top3 = sorted(htft.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    return {
+        "sport":      "football",
+        "league":     match_info.get("league", ""),
+        "home_team":  match_info.get("home_team", ""),
+        "away_team":  match_info.get("away_team", ""),
+        "match_date": match_info.get("date", ""),
+        "market":     "HTFT",
+        "best_vb":    best_vb,
+        "htft_probs": htft,
+        "top3_htft":  [{"combo": k, "name": _HTFT_NAMES.get(k, k),
+                         "prob": v} for k, v in top3],
+    }

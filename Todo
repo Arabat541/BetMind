@@ -152,43 +152,47 @@ Stack : PostgreSQL 16 + Redis 7 + betmind + betmind-dashboard
 
 ## 🔴 Priorité 1 — Impact immédiat ROI
 
-### AV — Monte Carlo Kelly (risk of ruin réel)
-  Simuler 1000 scénarios sur 50 paris avec les probas du modèle
-  Si probabilité de ruine > 5% → réduire la mise automatiquement
-  Plus robuste que le Kelly fractionnel fixe actuel
+### ✅ AV — Monte Carlo Kelly (risk of ruin réel) — FAIT
+  monte_carlo_kelly() dans bankroll.py — 1000 scénarios × 50 paris, Poisson multiplicatif
+  Si P(ruine > 10% bankroll) > 5% → réduit fraction par paliers 0.75/0.50/0.33/0.25
+  recommended_stake() utilise monte_carlo_kelly() — ruin_prob dans chaque signal
 
-### AW — Expected Points (xPTS) par équipe
-  Calculer xPTS depuis xG Understat déjà en DB (xPTS = Σ proba_win*3 + proba_draw*1)
-  Écart pts_réels − xPTS → surperformance tend à régresser (très prédictif fin de saison)
-  Nouvelles features : home_xpts_diff, away_xpts_diff dans FEATURE_COLS
+### ✅ AW — Expected Points (xPTS) par équipe — FAIT
+  _compute_xpts(xg_for, xg_against) via Poisson bivarié dans train_from_csv.py
+  home/away_xpts + home/away_xpts_diff (écart pts_réels − xPTS) dans FEATURE_COLS (105 features)
+  Calculé en live dans feature_engineering.py depuis home_xg_avg/home_pts_per_game existants
 
-### AX — Pondération temporelle dans l'entraînement
-  sample_weight exponentiel décroissant dans XGBClassifier (matchs récents pèsent plus)
-  Impact direct sur la précision en cours de saison sans changer l'architecture
-  Paramètre decay_rate à tuner avec Optuna
+### ✅ AX — Pondération temporelle dans l'entraînement — FAIT
+  _compute_sample_weights(dates, decay_rate) — poids exp décroissants normalisés
+  decay_rate tunée par Optuna (0.0→3.0) avec sample_weight dans chaque fold XGB
+  Appliqué à CalibratedClassifierCV, XGBClassifier final, LGB ensemble
 
 
 ## 🟠 Priorité 2 — Nouveaux marchés
 
-### AY — Marché Exact Goals (0/1/2/3/4+)
-  Distribution Poisson déjà calculée → dériver probas par nombre exact de buts
-  Marché peu efficient = edges plus faciles à trouver
-  Extension naturelle de dc_correct_scores() dans dixon_coles.py
+### ✅ AY — Marché Exact Goals (0/1/2/3/4+) — FAIT
+  dc_exact_goals() dans dixon_coles.py — matrice DC agrégée par nombre total de buts
+  fetch_exact_goals_odds() depuis marché "totals" The Odds API → probas implicites dérivées
+  build_exact_goals_signal() + send_exact_goals_alert() — EG_EDGE_MIN=8%, EG_MIN_PROB=5%
+  Intégré dans predictor.py (league_eg_odds_map)
 
-### AZ — Half Time / Full Time (HT/FT)
-  Prédire simultanément score mi-temps et résultat final (9 combinaisons HH/HD/HA/DH...)
-  Deux distributions Poisson indépendantes pour chaque mi-temps
-  Cotes HT/FT typiquement mal calibrées par les books
+### ✅ AZ — Half Time / Full Time (HT/FT) — FAIT
+  dc_htft() dans dixon_coles.py — 9 combinaisons via 2 Poisson indépendants par mi-temps
+  fetch_htft_odds() depuis marché "h2h_h1" The Odds API
+  build_htft_signal() + send_htft_alert() — HTFT_EDGE_MIN=7%, HTFT_MIN_PROB=8%
+  Intégré dans predictor.py (league_htft_odds_map)
 
 
 ## 🟡 Priorité 3 — Infrastructure & KPIs
 
-### BA — Rapport PDF hebdomadaire automatique
-  matplotlib + reportlab : PDF envoyé par Telegram chaque lundi
-  Graphiques ROI, CLV, SHAP importance, top/flop ligues sur 7 jours
-  Zéro clé API supplémentaire
+### ✅ BA — Rapport PDF hebdomadaire automatique — FAIT
+  pdf_report.py — generate_weekly_report() avec matplotlib PdfPages (pas de dep extra)
+  Page 1 : courbe P&L + tableau résumé / Page 2 : barres P&L par ligue
+  send_weekly_pdf_report() + send_document_file() dans telegram_bot.py
+  Schedulé le lundi à 08h30 dans predictor.py
 
-### BB — CLV réalisé à la fermeture (Closing Line Value)
-  result_checker.py : vérifier cote de clôture au moment du résultat
-  Calculer clv_realized = cote_fermeture / cote_utilisée − 1 → stocker en DB
-  KPI le plus critique pour valider l'edge long terme du modèle
+### ✅ BB — CLV réalisé à la fermeture (Closing Line Value) — FAIT
+  clv_realized REAL colonne ajoutée à predictions (migration auto dans init_db())
+  settle_prediction() calcule clv_realized = odd_closing / odd_used − 1 si odd_closing dispo
+  update_clv_realized() dans result_checker.py — recalcule pour prédictions réglées sans CLV
+  Schedulé quotidien à 06h30 dans predictor.py

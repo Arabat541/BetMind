@@ -21,9 +21,9 @@ from data_fetcher import (
     get_fd_quota_used, count_active_bets_for_league, get_team_exposure,
 )
 from feature_engineering import build_football_features, build_nba_features
-from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds, build_bhg_signal, fetch_bhg_odds, detect_dutching_opportunity, enrich_signal_with_line_shop
+from model import BettingModel, build_prediction_signal, build_ou_signal, build_btts_signal, detect_ah_value_bet, detect_implied_value, detect_arbitrage, build_correct_score_signal, fetch_correct_score_odds, detect_rlm, fetch_opening_odds, build_bhg_signal, fetch_bhg_odds, detect_dutching_opportunity, enrich_signal_with_line_shop, build_exact_goals_signal, fetch_exact_goals_odds, build_htft_signal, fetch_htft_odds
 from bankroll import BankrollTracker, recommended_stake
-from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert, send_bhg_alert, send_dutch_alert, send_injury_sentiment_alert
+from telegram_bot import send_prediction_alert, send_bankroll_alert, send_weekly_summary, send_message, send_stop_loss_alert, send_odds_movement_alert, send_correct_score_alert, send_rlm_alert, send_bhg_alert, send_dutch_alert, send_injury_sentiment_alert, send_exact_goals_alert, send_htft_alert, send_weekly_pdf_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +79,8 @@ def run_football_predictions():
     league_cs_odds_map   = {lg: fetch_correct_score_odds(key) for lg, key in _LEAGUE_KEYS.items()}
     league_open_odds_map = {lg: fetch_opening_odds(key)       for lg, key in _LEAGUE_KEYS.items()}
     league_bhg_odds_map  = {lg: fetch_bhg_odds(key)           for lg, key in _LEAGUE_KEYS.items()}
+    league_eg_odds_map   = {lg: fetch_exact_goals_odds(key)   for lg, key in _LEAGUE_KEYS.items()}
+    league_htft_odds_map = {lg: fetch_htft_odds(key)          for lg, key in _LEAGUE_KEYS.items()}
 
     signals       = []
     bankroll      = tracker.get_balance()
@@ -451,6 +453,52 @@ def run_football_predictions():
                         logger.info(
                             f"  [BHG] Value bet: {fix['home_team']} vs {fix['away_team']} "
                             f"edge={bhg_sig['edge']:.1%} @ {bhg_sig['odd']:.2f}"
+                        )
+
+            # ── AY — Exact Goals ────────────────────────────────
+            eg_odds_all = league_eg_odds_map.get(fix["league"], {})
+            if eg_odds_all and daily_staked < daily_limit:
+                eg_impl = {}
+                for event_key, impl in eg_odds_all.items():
+                    h_part = event_key.split("|")[0] if "|" in event_key else event_key
+                    if fix["home_team"].split()[0].lower() in h_part.lower():
+                        eg_impl = impl
+                        break
+                if eg_impl:
+                    eg_sig = build_exact_goals_signal(
+                        features=features,
+                        eg_implied=eg_impl,
+                        match_info={"league": fix["league"], "home_team": fix["home_team"],
+                                    "away_team": fix["away_team"], "date": fix.get("date", "")},
+                    )
+                    if eg_sig:
+                        send_exact_goals_alert(eg_sig)
+                        logger.info(
+                            f"  [EG] Value bet: {fix['home_team']} vs {fix['away_team']} "
+                            f"goals={eg_sig['best_vb']['label']} edge={eg_sig['best_vb']['edge']:.1%}"
+                        )
+
+            # ── AZ — Half Time / Full Time ───────────────────────
+            htft_odds_all = league_htft_odds_map.get(fix["league"], {})
+            if htft_odds_all and daily_staked < daily_limit:
+                h1_odds = {}
+                for event_key, odds in htft_odds_all.items():
+                    h_part = event_key.split("|")[0] if "|" in event_key else event_key
+                    if fix["home_team"].split()[0].lower() in h_part.lower():
+                        h1_odds = odds
+                        break
+                if h1_odds:
+                    htft_sig = build_htft_signal(
+                        features=features,
+                        h1_odds=h1_odds,
+                        match_info={"league": fix["league"], "home_team": fix["home_team"],
+                                    "away_team": fix["away_team"], "date": fix.get("date", "")},
+                    )
+                    if htft_sig:
+                        send_htft_alert(htft_sig)
+                        logger.info(
+                            f"  [HTFT] Value bet H1: {fix['home_team']} vs {fix['away_team']} "
+                            f"side={htft_sig['best_vb']['side']} edge={htft_sig['best_vb']['edge']:.1%}"
                         )
 
             # ── AR — Dutching multi-outcomes ─────────────────────
@@ -1157,19 +1205,36 @@ def _run_account_health():
     run_health_check_accounts(alert_fn=send_account_health_alert)
 
 
+def _run_weekly_pdf_report():
+    """Génère et envoie le rapport PDF hebdomadaire (BA)."""
+    from telegram_bot import send_weekly_pdf_report
+    send_weekly_pdf_report()
+
+
+def _run_clv_update():
+    """Calcule le CLV réalisé pour les prédictions réglées (BB)."""
+    try:
+        from result_checker import update_clv_realized
+        update_clv_realized()
+    except Exception as e:
+        logger.warning(f"CLV update: {e}")
+
+
 def start_scheduler():
     logger.info("Scheduler démarré.")
-    schedule.every().day.at("07:30").do(run_health_check)      # healthcheck avant cycle
+    schedule.every().day.at("07:30").do(run_health_check)          # healthcheck avant cycle
     schedule.every().day.at("08:00").do(run_with_results)
     schedule.every().day.at("18:00").do(run_with_results)
     schedule.every().day.at("22:00").do(run_nba_predictions)
-    schedule.every().day.at("23:30").do(send_daily_report)    # résumé fin de journée
-    schedule.every().day.at("02:00").do(backup_database)       # backup DB quotidien
-    schedule.every().day.at("10:00").do(check_silence)        # monitoring quotidien
+    schedule.every().day.at("23:30").do(send_daily_report)          # résumé fin de journée
+    schedule.every().day.at("02:00").do(backup_database)            # backup DB quotidien
+    schedule.every().day.at("10:00").do(check_silence)              # monitoring quotidien
     schedule.every().monday.at("09:00").do(send_weekly_report)
-    schedule.every().monday.at("03:00").do(retrain_models)  # 1er lundi du mois seulement
-    schedule.every(2).minutes.do(_run_steam_detection)         # AT — steam move detector
-    schedule.every().day.at("06:00").do(_run_account_health)   # AU — account health check
+    schedule.every().monday.at("08:30").do(_run_weekly_pdf_report)  # BA — rapport PDF
+    schedule.every().monday.at("03:00").do(retrain_models)          # 1er lundi du mois seulement
+    schedule.every(2).minutes.do(_run_steam_detection)              # AT — steam move detector
+    schedule.every().day.at("06:00").do(_run_account_health)        # AU — account health check
+    schedule.every().day.at("06:30").do(_run_clv_update)            # BB — CLV réalisé
     while True:
         schedule.run_pending()
         time.sleep(60)

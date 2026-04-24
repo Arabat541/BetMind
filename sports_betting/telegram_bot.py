@@ -617,6 +617,108 @@ def send_injury_sentiment_alert(home_team: str, away_team: str,
     send_message("\n".join(lines))
 
 
+def send_exact_goals_alert(signal: dict):
+    """Alerte Telegram value bet Exact Goals (AY)."""
+    vb    = signal.get("best_vb", {})
+    label = vb.get("label", "?")
+    model = signal.get("model_probs", {})
+
+    probs_str = "  ".join(
+        f"{k}:{v:.0%}" for k, v in sorted(model.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 99)
+    )
+
+    lines = [
+        "⚽ <b>EXACT GOALS — Value Bet</b>",
+        "",
+        f"<b>{signal.get('home_team', '')} vs {signal.get('away_team', '')}</b>",
+        f"🏆 {signal.get('league', '')} — {signal.get('match_date', '')}",
+        "",
+        f"🎯 Buts exacts : <b>{label}</b>",
+        f"📊 Modèle       : {vb.get('p_model', 0):.1%}",
+        f"📉 Implicite    : {vb.get('p_implied', 0):.1%}",
+        f"✅ Edge         : +{vb.get('edge', 0):.1%}",
+        f"💸 Cote implicite : {vb.get('implied_odd', 0):.2f}",
+        "",
+        f"Distribution modèle : {probs_str}",
+        "",
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_htft_alert(signal: dict):
+    """Alerte Telegram value bet Half Time / Full Time (AZ)."""
+    vb   = signal.get("best_vb", {})
+    top3 = signal.get("top3_htft", [])
+    SIDE = {"H": "Domicile", "D": "Nul", "A": "Extérieur"}
+
+    top3_str = "\n".join(
+        f"  {t['name']} : {t['prob']:.1%}" for t in top3
+    )
+
+    lines = [
+        "⏱ <b>HT/FT — Value Bet 1ère mi-temps</b>",
+        "",
+        f"<b>{signal.get('home_team', '')} vs {signal.get('away_team', '')}</b>",
+        f"🏆 {signal.get('league', '')} — {signal.get('match_date', '')}",
+        "",
+        f"🎯 1ère mi-temps : <b>{SIDE.get(vb.get('side', ''), vb.get('side', ''))}</b>",
+        f"📊 Modèle        : {vb.get('p_model', 0):.1%}",
+        f"📉 Implicite     : {vb.get('p_implied', 0):.1%}",
+        f"✅ Edge          : +{vb.get('edge', 0):.1%}",
+        f"💸 Cote          : {vb.get('odd', 0):.2f}",
+        "",
+        "Top 3 HT/FT modèle :",
+        top3_str,
+        "",
+        "🤖 BetMind Agent",
+    ]
+    send_message("\n".join(lines))
+
+
+def send_document_file(file_path: str, caption: str = "") -> bool:
+    """Envoie un fichier (PDF, image…) via Telegram sendDocument."""
+    from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    import requests as _req
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        with open(file_path, "rb") as f:
+            r = _req.post(url,
+                          data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                          files={"document": f},
+                          timeout=30)
+        return r.status_code == 200
+    except Exception as e:
+        logger.warning(f"send_document_file failed: {e}")
+        return False
+
+
+def send_weekly_pdf_report():
+    """Génère et envoie le rapport PDF hebdomadaire (BA)."""
+    try:
+        from pdf_report import generate_weekly_report
+        path = generate_weekly_report()
+        if not path:
+            send_message("📊 <b>Rapport hebdomadaire</b>\nAucun paris cette semaine.")
+            return
+        caption = f"📊 Rapport BetMind — semaine du {__import__('datetime').date.today()}"
+        ok = send_document_file(path, caption=caption)
+        if ok:
+            logger.info("Rapport PDF hebdomadaire envoyé via Telegram.")
+        else:
+            logger.warning("Rapport PDF généré mais envoi Telegram échoué.")
+        try:
+            import os
+            os.unlink(path)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"send_weekly_pdf_report: {e}")
+        send_message(f"⚠️ Rapport PDF — erreur : {e}")
+
+
 def send_account_health_alert(report: dict):
     """Alerte Telegram pour la santé des comptes bookmakers (AU)."""
     lines = [
