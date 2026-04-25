@@ -202,11 +202,18 @@ def get_football_result(home_team: str, away_team: str,
     """
     date_str = match_date[:10]
 
-    # Champions League : ESPN direct (plus fiable que football-data.org gratuit)
+    # Champions League : ESPN direct (non couvert par football-data.org gratuit)
     if "champion" in league.lower():
         return _get_espn_result(home_team, away_team, date_str, "Champions League")
 
-    # Ligues domestiques : football-data.org d'abord
+    # Ligues couvertes par ESPN : priorité ESPN (pas de quota contrairement à football-data.org)
+    if league in _ESPN_LEAGUE_SLUGS:
+        result = _get_espn_result(home_team, away_team, date_str, league)
+        if result is not None:
+            return result
+        logger.info(f"ESPN vide, fallback football-data.org pour {home_team} vs {away_team}")
+
+    # Fallback football-data.org (quota 90 req/jour — utilisé en dernier recours)
     matches = _get_football_matches_for_date(date_str)
     for match in matches:
         h = match["homeTeam"]["name"]
@@ -219,11 +226,6 @@ def get_football_result(home_team: str, away_team: str,
         if hg is None or ag is None:
             return None
         return "H" if hg > ag else ("A" if ag > hg else "D")
-
-    # Fallback ESPN pour les ligues couvertes
-    if league in _ESPN_LEAGUE_SLUGS:
-        logger.info(f"Fallback ESPN pour {home_team} vs {away_team} ({league})")
-        return _get_espn_result(home_team, away_team, date_str, league)
 
     return None
 

@@ -677,10 +677,13 @@ def fetch_nba_team_stats(team_id: int, last_n: int = 10) -> dict:
         return _nba_stats_cache[team_id]
 
     time.sleep(2)  # respect rate limit BallDontLie
+    # NBA season year = start year (2025 for the 2025-26 season)
+    now = datetime.now()
+    nba_season = now.year if now.month >= 10 else now.year - 1
     data = _balldontlie_get("games", {
         "team_ids[]": team_id,
         "per_page":   last_n,
-        "seasons[]":  2024
+        "seasons[]":  nba_season
     })
     games = data.get("data", [])
     if not games:
