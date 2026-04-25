@@ -428,7 +428,7 @@ def features_to_dataframe(features: dict) -> pd.DataFrame:
 
 
 def get_feature_columns(sport: str = "football") -> list:
-    """Retourne la liste ordonnée des colonnes features."""
+    """Retourne la liste ordonnée des colonnes features — doit rester synchronisé avec train_from_csv.py FEATURE_COLS."""
     if sport == "football":
         return [
             "home_form", "away_form", "form_diff",
@@ -446,6 +446,12 @@ def get_feature_columns(sport: str = "football") -> list:
             "h2h_home_win_rate", "h2h_draw_rate", "h2h_away_win_rate",
             "h2h_avg_goals", "h2h_matches",
             "home_lambda", "away_lambda", "total_goals_exp",
+            # Cotes bookmaker — signal fort
+            "impl_home", "impl_draw", "impl_away",
+            "odd_home", "odd_draw", "odd_away", "has_odds",
+            # Cotes de fermeture — AB
+            "impl_cl_home", "impl_cl_draw", "impl_cl_away",
+            "cl_move_home", "cl_move_draw", "cl_move_away",
             # Shots (proxy xG) — A
             "home_sot_avg", "away_sot_avg",
             "home_sot_ag_avg", "away_sot_ag_avg",
@@ -457,19 +463,33 @@ def get_feature_columns(sport: str = "football") -> list:
             # Motivation — G
             "home_relegation_gap", "away_relegation_gap",
             "home_title_gap",      "away_title_gap",
-            # Météo — J
-            "rainy_match",
             # ELO dynamique — S
             "home_elo", "away_elo", "elo_diff",
-            # Cotes de fermeture — AB
-            "impl_cl_home", "impl_cl_draw", "impl_cl_away",
-            "cl_move_home", "cl_move_draw", "cl_move_away",
+            # Arbitre — X
+            "referee_avg_goals", "referee_home_bias",
             # xG réel Understat — W
             "home_xg_avg", "away_xg_avg",
             "home_xga_avg", "away_xga_avg",
             "xg_diff", "xga_diff",
             # Valeur marchande effectifs — Y
             "home_squad_value", "away_squad_value", "squad_value_ratio",
+            # LSTM form — AJ
+            "home_lstm_form", "away_lstm_form", "lstm_form_diff",
+            # Player-level xG loss — AK
+            "home_xg_loss", "away_xg_loss",
+            "home_xg_loss_pct", "away_xg_loss_pct",
+            "home_top_scorer_share", "away_top_scorer_share",
+            # Fixture congestion — AN
+            "home_congestion", "away_congestion",
+            "home_has_europe", "away_has_europe",
+            "home_congestion_score", "away_congestion_score",
+            # Distance déplacement — AO
+            "away_travel_km", "away_timezone_diff", "away_travel_score",
+            # Sentiment NLP blessures — AP
+            "home_injury_sentiment", "away_injury_sentiment",
+            "home_injury_count",     "away_injury_count",
+            # Expected Points — AW
+            "home_xpts", "away_xpts", "home_xpts_diff", "away_xpts_diff",
         ]
     elif sport == "ou_football":
         return [

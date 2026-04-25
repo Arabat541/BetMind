@@ -758,7 +758,7 @@ def fetch_correct_score_odds(league_key: str) -> dict:
         from data_fetcher import _odds_get
         data = _odds_get(f"sports/{league_key}/odds", {
             "regions": "eu",
-            "markets": "h2h_lay,scorers",
+            "markets": "h2h",
             "oddsFormat": "decimal",
         }, ttl=180)
         if not data or not isinstance(data, list):
@@ -862,7 +862,6 @@ def fetch_opening_odds(league_key: str) -> dict:
             "regions":    "eu",
             "markets":    "h2h",
             "oddsFormat": "decimal",
-            "bookmakers": "pinnacle,betfair_ex_eu,unibet",
         }, ttl=300)
         if not data or not isinstance(data, list):
             return {}
