@@ -174,22 +174,110 @@ _AFOOTBALL_LEAGUE_IDS = {
     "basketball_nba":             12,
 }
 
-def _odds_get_io(endpoint: str, params: dict) -> list:
-    """Fallback 1 — odds-api.io (100 req/h gratuit). Même structure que The Odds API."""
+# odds-api.io : slugs des ligues (différent de The Odds API)
+_ODDS_IO_LEAGUE_SLUGS = {
+    "soccer_france_ligue_one":   "france-ligue-1",
+    "soccer_epl":                "england-premier-league",
+    "soccer_spain_la_liga":      "spain-laliga",
+    "soccer_italy_serie_a":      "italy-serie-a",
+    "soccer_germany_bundesliga": "germany-bundesliga",
+    "soccer_uefa_champs_league": "international-clubs-uefa-champions-league",
+    "basketball_nba":            "usa-nba",
+}
+
+
+def _odds_get_io(league_key: str, market: str = "h2h") -> list:
+    """
+    Fallback 1 — odds-api.io (100 req/heure gratuit).
+    Workflow : /events → filtre pending → /odds par event → format The Odds API.
+    """
     if not ODDS_API_IO_KEY:
         return []
-    p = dict(params)
-    p["apiKey"] = ODDS_API_IO_KEY
-    url = f"{ODDS_API_IO_BASE}/{endpoint}"
+    slug = _ODDS_IO_LEAGUE_SLUGS.get(league_key)
+    if not slug:
+        return []
+
+    base = ODDS_API_IO_BASE
+    key  = ODDS_API_IO_KEY
+    sport = "basketball" if "nba" in league_key else "football"
+    cutoff = datetime.now() + timedelta(days=7)
+
     try:
-        r = _http_get_with_retry(url, params=p)
-        data = r.json()
-        if isinstance(data, list):
-            logger.info(f"odds-api.io fallback OK [{endpoint}]: {len(data)} events")
-            return data
+        r = _http_get_with_retry(f"{base}/events",
+                                  params={"apiKey": key, "sport": sport, "league": slug})
+        events_raw = r.json()
+        if not isinstance(events_raw, list):
+            return []
     except Exception as e:
-        logger.debug("odds-api.io error [%s]: %s", endpoint, e)
-    return []
+        logger.debug("odds-api.io events error [%s]: %s", league_key, e)
+        return []
+
+    # Filtrer les matchs à venir dans les 7 jours
+    pending = [
+        e for e in events_raw
+        if e.get("status") == "pending"
+        and datetime.fromisoformat(e["date"].replace("Z", "+00:00")).replace(tzinfo=None) < cutoff
+    ]
+
+    results = []
+    for ev in pending[:10]:   # max 10 events par ligue pour économiser le quota
+        eid       = ev["id"]
+        home_name = ev.get("home", "")
+        away_name = ev.get("away", "")
+        try:
+            ro = _http_get_with_retry(f"{base}/odds",
+                                       params={"apiKey": key, "eventId": eid,
+                                               "markets": "1x2" if market == "h2h" else "over-under",
+                                               "bookmakers": "Bet365,bwin,1xbet"})
+            od = ro.json()
+        except Exception:
+            continue
+
+        bookmakers_out = []
+        for bk_name, bk_markets in (od.get("bookmakers") or {}).items():
+            outcomes = []
+            for mkt in (bk_markets if isinstance(bk_markets, list) else []):
+                mkt_name = mkt.get("name", "")
+                # Marché 1X2 → ML (Money Line)
+                if market == "h2h" and mkt_name in ("ML", "1X2", "Match Winner"):
+                    for o in mkt.get("odds", []):
+                        h = float(o.get("home", 0) or 0)
+                        d = float(o.get("draw", 0) or 0)
+                        a = float(o.get("away", 0) or 0)
+                        if h and d and a:
+                            outcomes = [
+                                {"name": home_name, "price": h},
+                                {"name": "Draw",    "price": d},
+                                {"name": away_name, "price": a},
+                            ]
+                # Marché Over/Under
+                elif market == "totals" and "over" in mkt_name.lower():
+                    for o in mkt.get("odds", []):
+                        ov = float(o.get("over", 0) or 0)
+                        un = float(o.get("under", 0) or 0)
+                        if ov and un:
+                            outcomes = [
+                                {"name": "Over",  "price": ov, "point": 2.5},
+                                {"name": "Under", "price": un, "point": 2.5},
+                            ]
+            if outcomes:
+                bookmakers_out.append({
+                    "title": bk_name,
+                    "markets": [{"key": market, "outcomes": outcomes}],
+                })
+
+        if bookmakers_out:
+            results.append({
+                "id":           str(eid),
+                "home_team":    home_name,
+                "away_team":    away_name,
+                "commence_time": ev.get("date", ""),
+                "bookmakers":   bookmakers_out,
+            })
+
+    if results:
+        logger.info("odds-api.io OK [%s]: %d events", league_key, len(results))
+    return results
 
 
 def _odds_get_api_football(league_key: str, params: dict) -> list:
@@ -297,12 +385,13 @@ def _odds_get(endpoint: str, params: dict, ttl: int = 300) -> list:
                 logger.error("Odds API error [%s]: %s", endpoint, e)
 
         # ── Source 2 : odds-api.io ────────────────────────────
-        result = _odds_get_io(endpoint, params)
+        league_key = endpoint.replace("sports/", "").replace("/odds", "")
+        market     = params.get("markets", "h2h")
+        result = _odds_get_io(league_key, market)
         if result:
             return result
 
         # ── Source 3 : API-Football ───────────────────────────
-        league_key = endpoint.replace("sports/", "").replace("/odds", "")
         result = _odds_get_api_football(league_key, params)
         if result:
             return result
