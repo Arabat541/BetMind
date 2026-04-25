@@ -228,7 +228,7 @@ def _odds_get_io(league_key: str, market: str = "h2h") -> list:
             ro = _http_get_with_retry(f"{base}/odds",
                                        params={"apiKey": key, "eventId": eid,
                                                "markets": "1x2" if market == "h2h" else "over-under",
-                                               "bookmakers": "Bet365,bwin,1xbet"})
+                                               "bookmakers": "Bet365"})
             od = ro.json()
         except Exception:
             continue
