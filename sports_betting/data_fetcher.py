@@ -829,6 +829,25 @@ def init_db():
         except Exception:
             pass  # colonne déjà présente
 
+    # Index unique requis par ON CONFLICT — COALESCE(market,'') car NULL≠NULL dans PG
+    if is_postgres():
+        try:
+            with get_conn() as conn:
+                # Supprimer les doublons avant de créer l'index (garde le MIN(id))
+                conn.execute("""
+                    DELETE FROM predictions
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM predictions
+                        GROUP BY home_team, away_team, match_date, sport, COALESCE(market,'')
+                    )
+                """)
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS predictions_unique_match "
+                    "ON predictions (home_team, away_team, match_date, sport, COALESCE(market,''))"
+                )
+        except Exception as _e:
+            logger.warning("Unique index creation: %s", _e)
+
     # PostgreSQL : resynchronise la séquence predictions_id_seq au cas où elle
     # serait désynchronisée après une migration SQLite→PG (rows copiés avec IDs explicites).
     if is_postgres():
@@ -848,10 +867,9 @@ def save_prediction(pred: dict):
     from db import get_conn, ph, is_postgres
     try:
         with get_conn() as conn:
-            # ON CONFLICT DO NOTHING : si le même match est déjà enregistré
-            # (même équipes + date + market), on ignore silencieusement.
+            # ON CONFLICT DO NOTHING — utilise COALESCE(market,'') qui correspond à l'index PG
             conflict_clause = (
-                "ON CONFLICT (home_team, away_team, match_date, sport, market) DO NOTHING"
+                "ON CONFLICT (home_team, away_team, match_date, sport, COALESCE(market,'')) DO NOTHING"
                 if is_postgres() else ""
             )
             conn.execute(f"""
