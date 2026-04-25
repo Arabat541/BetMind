@@ -866,7 +866,7 @@ def build_row_features(row: pd.Series,
         "home_injury_count":     0.0,
         "away_injury_count":     0.0,
         # Expected Points — AW
-        **_get_xpts_features(home, away, xg_feats, hs, ass),
+        **_get_xpts_features(home, away, _xg_feats, hs, ass),
     }
 
 
