@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from config import (
     FOOTBALL_DATA_KEY, FOOTBALL_DATA_BASE,
     BALLDONTLIE_BASE, ODDS_API_BASE, THE_ODDS_API_KEY,
+    ODDS_API_IO_KEY, ODDS_API_IO_BASE,
+    API_FOOTBALL_KEY, API_FOOTBALL_BASE,
     FOOTBALL_LEAGUES, NBA_SEASON, DATA_DIR, DB_PATH,
     FORM_WINDOW_LONG, FD_DAILY_LIMIT,
     OPENWEATHER_KEY, STADIUM_COORDS,
@@ -162,23 +164,150 @@ def _fd_get(endpoint: str, params: dict = {}) -> dict:
         return {}
 
 
-def _odds_get(endpoint: str, params: dict, ttl: int = 300) -> dict:
-    """Wrapper pour The Odds API avec cache Redis (TTL 5 min par défaut)."""
+_AFOOTBALL_LEAGUE_IDS = {
+    "soccer_france_ligue_one":    61,
+    "soccer_epl":                 39,
+    "soccer_spain_la_liga":      140,
+    "soccer_italy_serie_a":      135,
+    "soccer_germany_bundesliga":  78,
+    "soccer_uefa_champs_league":   2,
+    "basketball_nba":             12,
+}
+
+def _odds_get_io(endpoint: str, params: dict) -> list:
+    """Fallback 1 — odds-api.io (100 req/h gratuit). Même structure que The Odds API."""
+    if not ODDS_API_IO_KEY:
+        return []
+    p = dict(params)
+    p["apiKey"] = ODDS_API_IO_KEY
+    url = f"{ODDS_API_IO_BASE}/{endpoint}"
+    try:
+        r = _http_get_with_retry(url, params=p)
+        data = r.json()
+        if isinstance(data, list):
+            logger.info(f"odds-api.io fallback OK [{endpoint}]: {len(data)} events")
+            return data
+    except Exception as e:
+        logger.debug("odds-api.io error [%s]: %s", endpoint, e)
+    return []
+
+
+def _odds_get_api_football(league_key: str, params: dict) -> list:
+    """
+    Fallback 2 — api-sports.io (100 req/j gratuit).
+    Convertit la réponse au format The Odds API {home_team, away_team, bookmakers[]}.
+    """
+    if not API_FOOTBALL_KEY:
+        return []
+    league_id = _AFOOTBALL_LEAGUE_IDS.get(league_key)
+    if not league_id:
+        return []
+    market = params.get("markets", "h2h")
+    now = datetime.now()
+    season = now.year if now.month >= 8 else now.year - 1
+    af_params = {"league": league_id, "season": season, "bookmaker": 8}  # bookmaker 8 = Bet365
+    if market == "totals":
+        af_params["bet"] = 5   # bet ID 5 = Over/Under 2.5
+    else:
+        af_params["bet"] = 1   # bet ID 1 = Match Winner (1X2)
+
+    try:
+        r = _http_get_with_retry(
+            f"{API_FOOTBALL_BASE}/odds",
+            headers={"x-apisports-key": API_FOOTBALL_KEY},
+            params=af_params,
+        )
+        response = r.json().get("response", [])
+    except Exception as e:
+        logger.debug("api-football odds error: %s", e)
+        return []
+
+    events = []
+    for item in response:
+        fix = item.get("fixture", {})
+        teams = item.get("teams", {})
+        home_team = teams.get("home", {}).get("name", "")
+        away_team = teams.get("away", {}).get("name", "")
+        if not home_team or not away_team:
+            continue
+        bookmakers = []
+        for bk in item.get("bookmakers", []):
+            markets_out = []
+            for bet in bk.get("bets", []):
+                if market == "h2h" and bet.get("id") != 1:
+                    continue
+                if market == "totals" and bet.get("id") != 5:
+                    continue
+                outcomes = []
+                for v in bet.get("values", []):
+                    label = v.get("value", "")
+                    price = float(v.get("odd", 0) or 0)
+                    if market == "h2h":
+                        name = home_team if label == "Home" else (away_team if label == "Away" else "Draw")
+                    else:
+                        name = label   # "Over" / "Under"
+                        point = 2.5
+                    entry = {"name": name, "price": price}
+                    if market == "totals":
+                        entry["point"] = 2.5
+                    outcomes.append(entry)
+                if outcomes:
+                    markets_out.append({"key": market, "outcomes": outcomes})
+            if markets_out:
+                bookmakers.append({"title": bk.get("name", ""), "markets": markets_out})
+        events.append({
+            "id":           str(fix.get("id", "")),
+            "home_team":    home_team,
+            "away_team":    away_team,
+            "commence_time": fix.get("date", ""),
+            "bookmakers":   bookmakers,
+        })
+    if events:
+        logger.info("api-football fallback OK [%s]: %d events", league_key, len(events))
+    return events
+
+
+def _odds_get(endpoint: str, params: dict, ttl: int = 300) -> list:
+    """
+    Wrapper Odds API avec cascade de fallbacks :
+    1. The Odds API (the-odds-api.com) — 500 req/mois gratuit
+    2. odds-api.io                      — 100 req/heure gratuit
+    3. api-sports.io (API-Football)     — 100 req/jour gratuit
+    """
     from cache import cached_get
-    # Clé de cache : endpoint + params sérialisés (sans apiKey)
     cache_params = {k: v for k, v in params.items() if k != "apiKey"}
     cache_key = f"odds:{endpoint}:{sorted(cache_params.items())}"
 
     def _fetch():
-        p = dict(params)
-        p["apiKey"] = THE_ODDS_API_KEY
-        url = f"{ODDS_API_BASE}/{endpoint}"
-        try:
-            r = _http_get_with_retry(url, params=p)
-            return r.json()
-        except Exception as e:
-            logger.error(f"Odds API error [{endpoint}]: {e}")
-            return {}
+        # ── Source 1 : The Odds API ───────────────────────────
+        if THE_ODDS_API_KEY:
+            p = dict(params)
+            p["apiKey"] = THE_ODDS_API_KEY
+            url = f"{ODDS_API_BASE}/{endpoint}"
+            try:
+                r = _http_get_with_retry(url, params=p)
+                data = r.json()
+                if isinstance(data, list):
+                    return data
+                # Quota épuisé ou 401 → essayer fallbacks
+                err = data.get("error_code", "") if isinstance(data, dict) else ""
+                if err:
+                    logger.warning("The Odds API quota/auth: %s — fallback activé", err)
+            except Exception as e:
+                logger.error("Odds API error [%s]: %s", endpoint, e)
+
+        # ── Source 2 : odds-api.io ────────────────────────────
+        result = _odds_get_io(endpoint, params)
+        if result:
+            return result
+
+        # ── Source 3 : API-Football ───────────────────────────
+        league_key = endpoint.replace("sports/", "").replace("/odds", "")
+        result = _odds_get_api_football(league_key, params)
+        if result:
+            return result
+
+        return []
 
     return cached_get(cache_key, _fetch, ttl=ttl)
 

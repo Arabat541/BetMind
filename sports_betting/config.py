@@ -9,7 +9,9 @@ load_dotenv()
 
 # ── APIs ────────────────────────────────────────────────────
 FOOTBALL_DATA_KEY  = os.getenv("FOOTBALL_DATA_KEY", "")     # football-data.org
-THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")      # the-odds-api.com
+THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")      # the-odds-api.com (500 req/mois gratuit)
+ODDS_API_IO_KEY    = os.getenv("ODDS_API_IO_KEY", "")       # odds-api.io (100 req/h gratuit — fallback 1)
+API_FOOTBALL_KEY   = os.getenv("API_FOOTBALL_KEY", "")      # api-sports.io (100 req/j gratuit — fallback 2)
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 BALLDONTLIE_KEY    = os.getenv("BALLDONTLIE_KEY", "")
@@ -19,6 +21,8 @@ OPENWEATHER_KEY    = os.getenv("OPENWEATHER_KEY", "")       # openweathermap.org
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 BALLDONTLIE_BASE   = "https://api.balldontlie.io/v1"
 ODDS_API_BASE      = "https://api.the-odds-api.com/v4"
+ODDS_API_IO_BASE   = "https://api.odds-api.io/v3"           # fallback 1
+API_FOOTBALL_BASE  = "https://v3.football.api-sports.io"    # fallback 2
 
 # ── Sports couverts (codes football-data.org) ────────────────
 FOOTBALL_LEAGUES = {
