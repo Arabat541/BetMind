@@ -32,24 +32,45 @@ _RSS_FEEDS = [
 ]
 
 # ── Patterns NLP ─────────────────────────────────────────────
+# Patterns volontairement stricts pour éviter les faux positifs
+# (ex: "look out for" ne doit pas déclencher OUT)
 _PATTERNS_OUT = [
-    r"\bruled out\b", r"\bwill miss\b", r"\bwon'?t feature\b",
-    r"\bsidelined\b", r"\bout for\b", r"\binjured\b", r"\boutside\b",
-    r"\bne jouera pas\b", r"\babsent\b", r"\bbless[eé]\b", r"\bforfeits?\b",
-    r"\bout of action\b", r"\bmiss(es|ing)? out\b",
+    r"\bruled out\b",
+    r"\bwill miss\b",
+    r"\bwon'?t feature\b",
+    r"\bsidelined\b",
+    r"\bout for (?:at least |the season|\d|several|weeks?|months?)",  # "out for 3 weeks" seulement
+    r"\bne jouera pas\b",
+    r"\bbless[eé]\b",
+    r"\bforfeits?\b",
+    r"\bout of action\b",
+    r"\bmiss(?:es|ing) the (?:match|game|fixture|clash)\b",
+    r"\blong[- ]term injur\w+",
+    r"\binjury absence\b",
 ]
 
 _PATTERNS_DOUBTFUL = [
-    r"\bdoubtful\b", r"\bfitness concern\b", r"\bfitness doubt\b",
-    r"\b50[- ]?50\b", r"\bunlikely to feature\b", r"\btouch and go\b",
-    r"\bincertain\b", r"\bdoute\b", r"\bnot (fully )?fit\b",
-    r"\blast[- ]minute fitness\b", r"\bin doubt\b",
+    r"\bdoubtful\b",
+    r"\bfitness concern\b",
+    r"\bfitness doubt\b",
+    r"\b50[- ]?50\b",
+    r"\bunlikely to feature\b",
+    r"\btouch and go\b",
+    r"\bincertain\b",
+    r"\bdoute\b",
+    r"\bnot (?:fully )?fit\b",
+    r"\blast[- ]minute fitness\b",
+    r"\bin doubt\b",
 ]
 
 _PATTERNS_RETURN = [
-    r"\breturns?\b", r"\bback (in )?training\b", r"\bcleared\b",
-    r"\bavailable\b", r"\bfit (and available|again)\b",
-    r"\bde retour\b", r"\brecov[eé]r\w+\b",
+    r"\bback in training\b",
+    r"\bcleared to play\b",
+    r"\bfit (?:and available|again|to play)\b",
+    r"\bde retour\b",
+    r"\brecov[eé]r(?:ed|ing)\b",
+    r"\bwelcome(?:s|d)? back\b",
+    r"\bexpected to return\b",
 ]
 
 _RE_OUT      = [re.compile(p, re.IGNORECASE) for p in _PATTERNS_OUT]
@@ -119,12 +140,52 @@ def _classify_text(text: str) -> tuple[str, float]:
     return "NEUTRAL", 0.0
 
 
+# Mots trop génériques pour identifier une équipe seuls
+_GENERIC_TEAM_WORDS = {
+    "fc", "sc", "ac", "as", "cf", "cd", "fk", "bk", "afc", "rsc",
+    "united", "city", "real", "club", "sporting", "athletic", "atletico",
+    "union", "racing", "olympique", "stade", "girondins", "hotspur",
+    "wanderers", "rovers", "county", "town",
+}
+
+
+def _team_significant_words(team_name: str) -> list[str]:
+    """Mots ≥5 chars qui distinguent vraiment l'équipe (hors génériques)."""
+    parts = re.split(r"[\s\-./]+", team_name)
+    return [p for p in parts
+            if len(p) >= 5 and p.lower() not in _GENERIC_TEAM_WORDS]
+
+
 def _team_matches(team_name: str, text: str) -> bool:
-    """Vérifie si le nom d'équipe (ou un mot significatif) apparaît dans le texte."""
-    words = [w for w in team_name.split() if len(w) >= 4]
-    if not words:
-        return team_name.lower() in text.lower()
-    return any(w.lower() in text.lower() for w in words)
+    """
+    Vérifie si l'article concerne réellement cette équipe.
+    Stratégie 1 : nom complet (ou sans suffixe FC/SC) en substring → très précis.
+    Stratégie 2 : TOUS les mots significatifs présents (AND logique).
+    Stratégie 3 : un seul mot unique ≥6 chars → match direct.
+    """
+    text_lower = text.lower()
+
+    # Stratégie 1 — nom complet
+    if team_name.lower() in text_lower:
+        return True
+
+    # Variante sans suffixe FC/SC/etc.
+    clean = re.sub(r"\s+(?:fc|sc|ac|as|cf|cd|afc|rsc)\s*$", "",
+                   team_name, flags=re.IGNORECASE).strip()
+    if len(clean) >= 6 and clean.lower() in text_lower:
+        return True
+
+    # Stratégie 2 — tous les mots significatifs
+    sig = _team_significant_words(team_name)
+    if len(sig) >= 2:
+        return all(w.lower() in text_lower for w in sig)
+
+    # Stratégie 3 — un seul mot unique et long (≥6 chars)
+    if len(sig) == 1 and len(sig[0]) >= 6:
+        return sig[0].lower() in text_lower
+
+    # Pas de mot suffisamment distinctif → exiger le nom exact
+    return False
 
 
 # ── Public API ────────────────────────────────────────────────
