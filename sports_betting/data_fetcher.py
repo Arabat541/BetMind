@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # Cache en mémoire pour les stats NBA (évite les 429)
 _nba_stats_cache = {}
 
+# Cache des événements odds-api.io par ligue (TTL 1h, évite les appels répétés pour h2h/totals/btts)
+_odds_io_events_cache: dict = {}   # key: league_key → {"ts": float, "events": list}
+
 # ── football-data.org : cache journalier + compteur de quota ────
 _fd_cache: dict = {}          # cache endpoint+params → réponse
 _fd_request_count: int = 0
@@ -189,7 +192,8 @@ _ODDS_IO_LEAGUE_SLUGS = {
 def _odds_get_io(league_key: str, market: str = "h2h") -> list:
     """
     Fallback 1 — odds-api.io (100 req/heure gratuit).
-    Workflow : /events → filtre pending → /odds par event → format The Odds API.
+    Workflow : /events (mis en cache 1h) → filtre pending → /odds par event → format The Odds API.
+    Le cache des événements évite de rappeler /events pour chaque market (h2h, totals, btts…).
     """
     if not ODDS_API_IO_KEY:
         return []
@@ -197,27 +201,32 @@ def _odds_get_io(league_key: str, market: str = "h2h") -> list:
     if not slug:
         return []
 
-    base = ODDS_API_IO_BASE
-    key  = ODDS_API_IO_KEY
+    base  = ODDS_API_IO_BASE
+    key   = ODDS_API_IO_KEY
     sport = "basketball" if "nba" in league_key else "football"
     cutoff = datetime.now() + timedelta(days=7)
+    now_ts = time.time()
 
-    try:
-        r = _http_get_with_retry(f"{base}/events",
-                                  params={"apiKey": key, "sport": sport, "league": slug})
-        events_raw = r.json()
-        if not isinstance(events_raw, list):
+    # ── Récupérer la liste des events (cache 1 heure) ──────────
+    cached = _odds_io_events_cache.get(league_key)
+    if cached and (now_ts - cached["ts"]) < 3600:
+        pending = cached["events"]
+    else:
+        try:
+            r = _http_get_with_retry(f"{base}/events",
+                                      params={"apiKey": key, "sport": sport, "league": slug})
+            events_raw = r.json()
+            if not isinstance(events_raw, list):
+                return []
+        except Exception as e:
+            logger.debug("odds-api.io events error [%s]: %s", league_key, e)
             return []
-    except Exception as e:
-        logger.debug("odds-api.io events error [%s]: %s", league_key, e)
-        return []
-
-    # Filtrer les matchs à venir dans les 7 jours
-    pending = [
-        e for e in events_raw
-        if e.get("status") == "pending"
-        and datetime.fromisoformat(e["date"].replace("Z", "+00:00")).replace(tzinfo=None) < cutoff
-    ]
+        pending = [
+            e for e in events_raw
+            if e.get("status") == "pending"
+            and datetime.fromisoformat(e["date"].replace("Z", "+00:00")).replace(tzinfo=None) < cutoff
+        ]
+        _odds_io_events_cache[league_key] = {"ts": now_ts, "events": pending}
 
     results = []
     for ev in pending[:10]:   # max 10 events par ligue pour économiser le quota
@@ -225,10 +234,12 @@ def _odds_get_io(league_key: str, market: str = "h2h") -> list:
         home_name = ev.get("home", "")
         away_name = ev.get("away", "")
         try:
+            time.sleep(2.0)   # ~30 req/min max → évite le burst limit
             ro = _http_get_with_retry(f"{base}/odds",
                                        params={"apiKey": key, "eventId": eid,
                                                "markets": "1x2" if market == "h2h" else "over-under",
-                                               "bookmakers": "Bet365"})
+                                               "bookmakers": "Bet365"},
+                                       max_retries=1)   # bail immédiat sur 429, pas de retry
             od = ro.json()
         except Exception:
             continue
@@ -384,12 +395,13 @@ def _odds_get(endpoint: str, params: dict, ttl: int = 300) -> list:
             except Exception as e:
                 logger.error("Odds API error [%s]: %s", endpoint, e)
 
-        # ── Source 2 : odds-api.io ────────────────────────────
+        # ── Source 2 : odds-api.io (h2h uniquement — quota 100 req/h) ──
         league_key = endpoint.replace("sports/", "").replace("/odds", "")
         market     = params.get("markets", "h2h")
-        result = _odds_get_io(league_key, market)
-        if result:
-            return result
+        if market == "h2h":
+            result = _odds_get_io(league_key, market)
+            if result:
+                return result
 
         # ── Source 3 : API-Football ───────────────────────────
         result = _odds_get_api_football(league_key, params)

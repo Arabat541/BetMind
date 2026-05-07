@@ -70,6 +70,18 @@ class BettingModel:
                 self.model = EnsembleModel.load(self.ensemble_path)
                 self.is_trained = True
                 logger.info(f"Ensemble loaded: {self.ensemble_path}")
+                # Lire les feature names depuis le XGBoost interne de l'EnsembleModel
+                try:
+                    inner = self.model.xgb_model
+                    # CalibratedClassifierCV wraps the estimator
+                    if hasattr(inner, "estimator"):
+                        inner = inner.estimator
+                    elif hasattr(inner, "calibrated_classifiers_"):
+                        inner = inner.calibrated_classifiers_[0].estimator
+                    self.feature_cols = list(inner.feature_names_in_)
+                    logger.info(f"Features: {len(self.feature_cols)}")
+                except Exception:
+                    self.feature_cols = None
                 return
             except Exception as e:
                 logger.warning(f"Ensemble load failed ({e}), falling back to XGB.")

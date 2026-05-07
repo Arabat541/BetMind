@@ -1,0 +1,18 @@
+[Unit]
+Description=BetMind Telegram Publisher — @BetmindAcademy
+After=network-online.target betmind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evrard
+WorkingDirectory=/home/evrard/apps/betmind
+ExecStart=/home/evrard/apps/betmind/venv/bin/python3 telegram_publisher.py
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=0
+StandardOutput=append:/home/evrard/apps/betmind/logs/publisher.log
+StandardError=append:/home/evrard/apps/betmind/logs/publisher.log
+
+[Install]
+WantedBy=multi-user.target

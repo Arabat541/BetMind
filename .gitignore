@@ -9,6 +9,7 @@ __pycache__/
 # Data & logs
 *.db
 *.log
+*.json
 
 # Models
 *.pkl
